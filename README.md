@@ -75,6 +75,10 @@ the ROS workspace, not inside this repository.
 Start the detection node in a separate terminal:
 
 ```bash
+source ~/miniconda3/bin/activate
+conda activate env_dino
+
+source /opt/ros/humble/setup.bash
 source /home/min/DINO_ws/install/setup.bash
 python3 -m efficientnav_detection.detection_node
 ```
@@ -84,7 +88,7 @@ which is the default.
 
 ## Running
 
-Run the main navigation experiment:
+Run the main navigation experiment directly:
 
 ```bash
 cd /home/min/test
@@ -108,8 +112,13 @@ The desktop UI can launch experiments, show live logs, inspect stored memory,
 and summarize result metrics.
 
 ```bash
+source ~/miniconda3/bin/activate
+conda activate test
+
 cd efficientnav_desktop_ui
-./run_desktop_ui.sh
+source /opt/ros/humble/setup.bash
+source /home/min/DINO_ws/install/setup.bash
+python3 app.py
 ```
 
 See `efficientnav_desktop_ui/README.md` for details.
