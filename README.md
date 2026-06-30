@@ -1,64 +1,130 @@
-## EfficientNav: On-Device Object-Goal Navigation with Navigation Map Caching and Retrieval
-This is also the official code repository for the paper [EfficientNav](https://arxiv.org/abs/2510.18546).
+# Memory Management for Visual-Language Navigation
 
-EfficientNav is a novel framework that enables efficient on-device Object Goal Navigation (ObjNav) using smaller language models. Developing LLM-based navigation system on local device is challenging, due to the **limited model capacity of smaller LLM planner** for understanding complex navigation maps.
-At the same time, the **long prompt introduced by the navigation map description** will cause high planning latency on local devices. 
-This project tackles the critical challenges of deploying LLM-based navigation agents on local devices by efficient navigation map caching and retrieval.
+This repository contains a local experiment version of EfficientNav for
+Object-Goal Navigation. The project focuses on running a visual-language
+navigation agent with AI2-THOR/ProcTHOR, ROS 2 object detection, navigation-map
+memory retrieval, KV-cache reuse, and H2O-style cache compression.
 
-## Key Features 🚀 
-- **Semantics-Aware Memory Retrieval**: Prunes redundant information in navigation maps to enhance smaller LLMs' environment understanding
+The code is based on the EfficientNav project, but this repository is organized
+around the local experiment setup used in this project rather than the original
+paper release layout.
 
-- **Discrete Memory Caching**: Efficiently saves and reuses KV cache to reduce planning latency
+## Main Changes
 
-- **Attention-Based Memory Clustering**: Recovers memory interactions for better model performance
+- Integrated AI2-THOR/ProcTHOR through `thor_adapter.py`
+- Uses InternVL3-1B as the default planner model
+- Uses a ROS 2 detection service for GroundingDINO object detection
+- Added navigation-map memory pruning and retrieval logic
+- Added KV-cache and H2O cache management in `h2o_cache.py`
+- Added a PySide6 desktop UI for experiment control and result inspection
+- Removed generated outputs, cached images, model weights, and local debug files from git
 
-- On the HM3D dataset, EfficientNav significantly reduces KV-cache recomputation and memory usage while improving navigation success rates—**even outperforming GPT-4-based planners**
+## Repository Structure
 
-## Installation
-Assuming you have conda installed, let's prepare a conda env:
+```text
+.
+├── efficientnav.py                 # Main navigation experiment entry point
+├── navigation_map.py               # Navigation memory, retrieval, and cache logic
+├── h2o_cache.py                    # H2O/KV-cache scoring and compression helpers
+├── thor_adapter.py                 # AI2-THOR/ProcTHOR adapter
+├── units.py                        # Detection utility wrappers
+├── dino_service_patch/             # ROS 2 detection service source/patch
+├── efficientnav_desktop_ui/        # PySide6 experiment UI
+├── data/                           # Scene dataset config files
+├── requirements.txt
+└── README.md
 ```
-conda create -n habitat python=3.9 cmake=3.14.0
-conda activate habitat
-```
-Install required packages:
-```
+
+The following local folders are intentionally ignored:
+
+- `models/`
+- `output/`
+- `tmp/`
+- `images_output/`
+- `navigation_images/`
+- `efficientnav_desktop_ui/data/`
+- `__pycache__/`
+
+## Requirements
+
+Install Python dependencies:
+
+```bash
 pip install -r requirements.txt
 ```
-Install habitat-sim:
+
+The desktop UI has a separate requirements file:
+
+```bash
+pip install -r efficientnav_desktop_ui/requirements.txt
 ```
-git clone https://github.com/facebookresearch/habitat-sim.git
-cd habitat-sim
-conda install habitat-sim headless -c conda-forge -c aihabitat
-```
-Install habitat-lab:
-```
-git clone --branch stable https://github.com/facebookresearch/habitat-lab.git
-cd habitat-lab
-pip install -e habitat-lab
-pip install -e habitat-baselines
-```
-Object detection is handled through a ROS 2 detection service. In this local setup,
-GroundingDINO is installed in the ROS workspace at `/home/min/DINO_ws`, not inside
-this repository.
+
+This project expects the following external resources to exist locally:
+
+- Planner model: `/home/min/test/models/InternVL3-1B`
+- CLIP model: `/home/min/models/clip-vit-base-patch32`
+- ROS 2 detection workspace: `/home/min/DINO_ws`
+
+Model weights are not committed to this repository.
+
+## Object Detection
+
+Object detection is handled by a ROS 2 service. GroundingDINO is installed in
+the ROS workspace, not inside this repository.
 
 Start the detection node in a separate terminal:
-```
+
+```bash
 source /home/min/DINO_ws/install/setup.bash
 python3 -m efficientnav_detection.detection_node
 ```
-Download CLIP checkpoint from https://huggingface.co/openai/clip-vit-base-patch32/tree/main.
 
-Download LLaVA-34b model checkpoint from https://huggingface.co/llava-hf/llava-v1.6-34b-hf/tree/main.
-
-Download habitat challenge scenes into `./data` from https://matterport.com/partners/meta.
+The planner connects to this service when `EFFICIENTNAV_USE_ROS2_DETECTION=1`,
+which is the default.
 
 ## Running
-```
-python efficientnav.py
+
+Run the main navigation experiment:
+
+```bash
+cd /home/min/test
+python3 efficientnav.py
 ```
 
-## Citation
+Useful environment variables:
+
+```bash
+export EFFICIENTNAV_TARGET_OBJECT=tv
+export EFFICIENTNAV_HOUSE_INDEX=0
+export EFFICIENTNAV_NUM_HOUSES=1
+export EFFICIENTNAV_USE_KV_CACHE=1
+export EFFICIENTNAV_USE_H2O=1
+export EFFICIENTNAV_PLANNER_MODEL_PATH=/home/min/test/models/InternVL3-1B
 ```
+
+## Desktop UI
+
+The desktop UI can launch experiments, show live logs, inspect stored memory,
+and summarize result metrics.
+
+```bash
+cd efficientnav_desktop_ui
+./run_desktop_ui.sh
+```
+
+See `efficientnav_desktop_ui/README.md` for details.
+
+## Notes
+
+- `models/` is ignored because planner checkpoints are large.
+- Runtime images and experiment outputs are regenerated during execution.
+- The old `run_all.sh`, `run_planner.sh`, and `run_detection.sh` scripts were removed because execution now uses direct Python commands and the ROS 2 detection node.
+
+## Citation
+
+This project builds on EfficientNav:
+
+```bibtex
 @article{yang2025efficientnav,
   title={EfficientNav: Towards On-Device Object-Goal Navigation with Navigation Map Caching and Retrieval},
   author={Yang, Zebin and Zheng, Sunjian and Xie, Tong and Xu, Tianshi and Yu, Bo and Wang, Fan and Tang, Jie and Liu, Shaoshan and Li, Meng},
