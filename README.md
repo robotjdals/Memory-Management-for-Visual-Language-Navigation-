@@ -61,9 +61,9 @@ pip install -r efficientnav_desktop_ui/requirements.txt
 
 This project expects the following external resources to exist locally:
 
-- Planner model: `/home/min/test/models/InternVL3-1B`
-- CLIP model: `/home/min/models/clip-vit-base-patch32`
-- ROS 2 detection workspace: `/home/min/DINO_ws`
+- Planner model: `./models/InternVL3-1B`
+- CLIP model: `~/models/clip-vit-base-patch32`
+- ROS 2 detection workspace: `~/DINO_ws`
 
 Model weights are not committed to this repository.
 
@@ -79,7 +79,7 @@ source ~/miniconda3/bin/activate
 conda activate env_dino
 
 source /opt/ros/humble/setup.bash
-source /home/min/DINO_ws/install/setup.bash
+source ~/DINO_ws/install/setup.bash
 python3 -m efficientnav_detection.detection_node
 ```
 
@@ -91,7 +91,6 @@ which is the default.
 Run the main navigation experiment directly:
 
 ```bash
-cd /home/min/test
 python3 efficientnav.py
 ```
 
@@ -103,7 +102,7 @@ export EFFICIENTNAV_HOUSE_INDEX=0
 export EFFICIENTNAV_NUM_HOUSES=1
 export EFFICIENTNAV_USE_KV_CACHE=1
 export EFFICIENTNAV_USE_H2O=1
-export EFFICIENTNAV_PLANNER_MODEL_PATH=/home/min/test/models/InternVL3-1B
+export EFFICIENTNAV_PLANNER_MODEL_PATH=./models/InternVL3-1B
 ```
 
 ## Desktop UI
@@ -117,7 +116,7 @@ conda activate test
 
 cd efficientnav_desktop_ui
 source /opt/ros/humble/setup.bash
-source /home/min/DINO_ws/install/setup.bash
+source ~/DINO_ws/install/setup.bash
 python3 app.py
 ```
 
