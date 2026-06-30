@@ -1,0 +1,9 @@
+string position_id
+int32 angle
+string prompt
+uint32 height
+uint32 width
+string encoding
+uint8[] data
+---
+string result_json

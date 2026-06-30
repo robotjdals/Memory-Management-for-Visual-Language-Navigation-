@@ -1,0 +1,3510 @@
+import os
+import sys
+import site
+import json
+import re
+import time
+
+# Keep the planner env self-contained by preventing ~/.local packages from
+# shadowing conda-installed torch/torchvision dependencies.
+site.ENABLE_USER_SITE = False
+user_site = site.getusersitepackages()
+if user_site:
+    sys.path = [path for path in sys.path if os.path.abspath(path) != os.path.abspath(user_site)]
+
+from transformers import (
+    AutoModel,
+    AutoModelForImageTextToText,
+    AutoTokenizer,
+    AutoProcessor,
+)
+try:
+    from transformers import AutoModelForVision2Seq
+except ImportError:
+    AutoModelForVision2Seq = None
+try:
+    from transformers.cache_utils import DynamicCache
+except ImportError:
+    DynamicCache = None
+import torch
+import random
+import numpy as np
+import imageio
+import matplotlib.pyplot as plt
+from math import ceil
+from PIL import Image as I, ImageDraw
+import math
+import gc
+import copy
+from collections import namedtuple
+from transformers import CLIPTokenizer, CLIPTextModel
+from scipy.spatial.distance import cosine,euclidean
+from torchvision import transforms as T
+from torchvision.transforms.functional import InterpolationMode
+import datetime
+current_time = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
+from navigation_map import Navigation_map
+try:
+    from h2o_cache import (
+        apply_h2o_to_legacy_cache,
+        build_attention_heavy_scores,
+        build_goal_heavy_scores,
+        build_segment_heavy_scores,
+        build_semantic_heavy_scores,
+        h2o_config,
+        h2o_enabled,
+        h2o_protected_prefix_outside_budget,
+        h2o_use_attention_scores,
+        merge_heavy_scores,
+        protected_suffix_from_marker,
+        trim_heavy_scores,
+    )
+except ImportError:
+    from .h2o_cache import (
+        apply_h2o_to_legacy_cache,
+        build_attention_heavy_scores,
+        build_goal_heavy_scores,
+        build_segment_heavy_scores,
+        build_semantic_heavy_scores,
+        h2o_config,
+        h2o_enabled,
+        h2o_protected_prefix_outside_budget,
+        h2o_use_attention_scores,
+        merge_heavy_scores,
+        protected_suffix_from_marker,
+        trim_heavy_scores,
+    )
+import units
+from units import load_image,load_model,get_grounding_output,plot_boxes_to_image,last_non_space_char,make_cfg
+from thor_adapter import ThorAgentState, ThorShortestPath, ThorSim, canonical_goal_name, load_procthor_houses, vector_to_yaw, yaw_to_vector
+import rclpy
+from rclpy.node import Node
+try:
+    from efficientnav_interfaces.srv import DetectObjects
+except ImportError:
+    DetectObjects = None
+
+print(f"[EfficientNav] running file: {__file__}")
+print(f"[EfficientNav] units module: {units.__file__}")
+
+os.makedirs("navigation_images", exist_ok=True)
+os.makedirs("tmp/navigation_images", exist_ok=True)
+os.environ.setdefault("HF_HOME", "/home/min/test/.hf_home")
+os.environ.setdefault("TRANSFORMERS_CACHE", "/home/min/test/.hf_home/transformers")
+os.makedirs(os.environ["HF_HOME"], exist_ok=True)
+os.makedirs(os.environ["TRANSFORMERS_CACHE"], exist_ok=True)
+
+os.environ.setdefault("ROS_DOMAIN_ID", "30")
+os.environ.setdefault("EFFICIENTNAV_USE_ROS2_DETECTION", "1")
+os.environ.setdefault("EFFICIENTNAV_USE_KV_CACHE", "1")
+os.environ.setdefault("EFFICIENTNAV_PLANNER_MODEL_PATH", "/home/min/test/models/InternVL3-1B")
+os.environ.setdefault("EFFICIENTNAV_CLIP_PATH", "/home/min/models/clip-vit-base-patch32")
+
+cuda_available = torch.cuda.is_available()
+cuda_device_count = torch.cuda.device_count() if cuda_available else 0
+primary_device = "cuda:0" if cuda_available and cuda_device_count > 0 else "cpu"
+max_memory = {idx: "47GiB" for idx in range(cuda_device_count)} if cuda_available else None
+planner_device_map = "auto" if cuda_device_count > 0 else None
+planner_model_path = os.environ.get("EFFICIENTNAV_PLANNER_MODEL_PATH", "/home/min/test/models/InternVL3-1B")
+print(f"[EfficientNav] planner model: {planner_model_path}")
+h2o_budget, h2o_recent_size, h2o_heavy_size, h2o_protected_prefix = h2o_config()
+print(
+    "[EfficientNav] H2O cache: "
+    f"enabled={h2o_enabled()} "
+    f"budget={h2o_budget} "
+    f"recent={h2o_recent_size} "
+    f"heavy={h2o_heavy_size} "
+    f"protected_prefix={h2o_protected_prefix} "
+    f"prefix_outside_budget={h2o_protected_prefix_outside_budget()}"
+)
+internvl_mode = "internvl" in planner_model_path.lower()
+planner_processor = None
+if not internvl_mode:
+    planner_processor = AutoProcessor.from_pretrained(
+        planner_model_path,
+        trust_remote_code=True,
+        fix_mistral_regex=True,
+    )
+    planner_tokenizer = getattr(planner_processor, "tokenizer", None)
+else:
+    planner_tokenizer = None
+if planner_tokenizer is None:
+    planner_tokenizer = AutoTokenizer.from_pretrained(
+        planner_model_path,
+        trust_remote_code=True,
+        fix_mistral_regex=False if internvl_mode else True,
+        use_fast=False if internvl_mode else True,
+    )
+if planner_tokenizer.pad_token is None:
+    planner_tokenizer.pad_token = planner_tokenizer.eos_token
+planner_model_kwargs = {
+    "torch_dtype": torch.float16 if cuda_available else torch.float32,
+    "low_cpu_mem_usage": True,
+    "trust_remote_code": True,
+}
+if internvl_mode:
+    planner_model_kwargs["low_cpu_mem_usage"] = False
+    planner_model_kwargs["use_flash_attn"] = False
+if planner_device_map is not None and not internvl_mode:
+    planner_model_kwargs["device_map"] = planner_device_map
+    if max_memory:
+        planner_model_kwargs["max_memory"] = max_memory
+if internvl_mode:
+    planner_model = AutoModel.from_pretrained(planner_model_path, **planner_model_kwargs)
+elif AutoModelForVision2Seq is not None:
+    try:
+        planner_model = AutoModelForVision2Seq.from_pretrained(planner_model_path, **planner_model_kwargs)
+    except Exception:
+        try:
+            planner_model = AutoModelForImageTextToText.from_pretrained(planner_model_path, **planner_model_kwargs)
+        except Exception:
+            planner_model = AutoModel.from_pretrained(planner_model_path, **planner_model_kwargs)
+else:
+    try:
+        planner_model = AutoModelForImageTextToText.from_pretrained(planner_model_path, **planner_model_kwargs)
+    except Exception:
+        planner_model = AutoModel.from_pretrained(planner_model_path, **planner_model_kwargs)
+planner_model.eval()
+if internvl_mode and cuda_available:
+    planner_model = planner_model.to(primary_device)
+planner_supports_vision = internvl_mode or hasattr(planner_processor, "image_processor")
+planner_chat_dtype = planner_model_kwargs["torch_dtype"] if cuda_available else torch.float32
+
+
+class PlannerTextProcessor:
+    def __init__(self, tokenizer, model=None, internvl_mode=False):
+        self.tokenizer = tokenizer
+        self.model = model
+        self.internvl_mode = internvl_mode
+
+    def apply_chat_template(self, conversation, tokenize=False, add_generation_prompt=True):
+        if self.internvl_mode:
+            template = self.model.conv_template.copy()
+            template.system_message = self.model.system_message
+            for message in conversation:
+                role = message.get("role", "user")
+                content = message.get("content", "")
+                template_role = template.roles[0] if role == "user" else template.roles[1]
+                template.append_message(template_role, content)
+            if add_generation_prompt:
+                template.append_message(template.roles[1], None)
+            prompt = template.get_prompt()
+            if tokenize:
+                return self.tokenizer(prompt, return_tensors="pt")
+            return prompt
+        if hasattr(self.tokenizer, "apply_chat_template"):
+            return self.tokenizer.apply_chat_template(
+                conversation,
+                tokenize=tokenize,
+                add_generation_prompt=add_generation_prompt,
+            )
+        prompt = "\n".join(str(message.get("content", "")) for message in conversation)
+        if tokenize:
+            return self.tokenizer(prompt, return_tensors="pt")
+        return prompt
+
+    def __call__(self, *args, **kwargs):
+        return self.tokenizer(*args, **kwargs)
+
+    def __getattr__(self, name):
+        return getattr(self.tokenizer, name)
+
+
+planner_text_processor = PlannerTextProcessor(
+    planner_tokenizer,
+    model=planner_model,
+    internvl_mode=internvl_mode,
+)
+
+
+def get_planner_eos_token_ids():
+    eos_token_ids = set()
+    if isinstance(planner_tokenizer.eos_token_id, int) and planner_tokenizer.eos_token_id >= 0:
+        eos_token_ids.add(planner_tokenizer.eos_token_id)
+    if hasattr(planner_tokenizer, "convert_tokens_to_ids"):
+        for token in ("<|im_end|>",):
+            token_id = planner_tokenizer.convert_tokens_to_ids(token)
+            if isinstance(token_id, int) and token_id >= 0:
+                eos_token_ids.add(token_id)
+    if internvl_mode and hasattr(planner_model, "conv_template"):
+        stop_token = str(planner_model.conv_template.sep).strip()
+        if stop_token:
+            token_id = planner_tokenizer.convert_tokens_to_ids(stop_token)
+            if isinstance(token_id, int) and token_id >= 0:
+                eos_token_ids.add(token_id)
+    return eos_token_ids
+
+
+def ensure_internvl_context_token_id():
+    if not internvl_mode:
+        return
+    img_context_token_id = planner_tokenizer.convert_tokens_to_ids("<IMG_CONTEXT>")
+    planner_model.img_context_token_id = img_context_token_id
+use_ros2_detection = os.environ.get("EFFICIENTNAV_USE_ROS2_DETECTION", "1") == "1"
+observation_rotation_pause = float(os.environ.get("EFFICIENTNAV_OBSERVATION_ROTATION_PAUSE", "0.25"))
+ros2_detection_timeout_sec = float(os.environ.get("EFFICIENTNAV_ROS2_DETECTION_TIMEOUT", "30.0"))
+
+
+grounding_dino_config_path = os.environ.get(
+    "EFFICIENTNAV_GDINO_CONFIG",
+    "",
+)
+checkpoint_path = os.environ.get(
+    "EFFICIENTNAV_GDINO_MODEL_ID",
+    "IDEA-Research/grounding-dino-base",
+)
+output_dir = "images_output"
+box_threshold = 0.5
+text_threshold = 0.25
+
+token_spans = None
+
+os.makedirs(output_dir, exist_ok=True)
+
+model_dino = None if use_ros2_detection else load_model(grounding_dino_config_path, checkpoint_path, cpu_only=not cuda_available)
+
+device = "cuda" if cuda_available else "cpu"
+device0 = primary_device
+local_model_path = os.environ.get("EFFICIENTNAV_CLIP_PATH", "/home/min/models/clip-vit-base-patch32")
+clip_tokenizer = CLIPTokenizer.from_pretrained(local_model_path)
+model_clip = CLIPTextModel.from_pretrained(local_model_path).to(device0)
+
+group_node = True ##
+delete_traj = True ##
+depth_threshould = 0.25
+hebing_threshould = 0.001
+node_pruning_num = 4
+object_describe_multi_time = False ##
+through_door = True ##
+use_traj = os.environ.get("EFFICIENTNAV_USE_TRAJECTORY_PROMPT", "1") == "1"
+pay_attention_to_door = True ##
+use_real_semetic = True ##
+early_stop  = True #
+directly_find =True ##
+use_kv_cache = os.environ.get("EFFICIENTNAV_USE_KV_CACHE", "1") == "1"
+use_pruning = True
+only_llm_baseline = os.environ.get("EFFICIENTNAV_ONLY_LLM_BASELINE", "0") == "1"
+single_object_bypass = os.environ.get("EFFICIENTNAV_SINGLE_OBJECT_BYPASS", "0") == "1"
+approach_visible_goal_with_gt = os.environ.get(
+    "EFFICIENTNAV_APPROACH_VISIBLE_GOAL_WITH_GT", "0"
+) == "1"
+
+num_episode = int(os.environ.get("EFFICIENTNAV_NUM_HOUSES", "20"))
+num_environment = int(os.environ.get("EFFICIENTNAV_NUM_ENVIRONMENTS", "1"))
+use_door_as_trajectory = False
+final_goal_list = ['toilet','tv','chair','sofa','bed','plant']
+trusted_planner_labels = {
+    'chair', 'sofa', 'tv', 'bed', 'plant', 'laptop', 'table', 'desk',
+    'window', 'wall', 'door', 'doorway', 'door frame', 'painting', 'cup',
+    'floorlamp', 'armchair', 'cabinet', 'lamp', 'phone', 'cellphone',
+    'tablet', 'statue', 'fridge', 'refrigerator', 'stool', 'box'
+}
+low_value_planner_labels = {'wall', 'floor', 'ceiling', 'tile', 'tiles', 'shadow', 'shadows'}
+transition_planner_labels = {'doorway', 'door frame', 'door'}
+semantic_anchor_labels = {
+    'table', 'diningtable', 'sidetable', 'desk', 'countertop', 'bed', 'sofa',
+    'chair', 'cabinet', 'shelf', 'mirror', 'sink', 'toilet', 'fridge',
+    'refrigerator', 'lamp', 'desklamp', 'floorlamp', 'plant', 'painting',
+    'picture', 'picture frame', 'window', 'box'
+}
+observation_noise_labels = {'shadow', 'shadows', 'background'}
+structural_subgoal_tokens = {
+    'a', 'an', 'the', 'of', 'with', 'wall', 'walls', 'floor', 'floors',
+    'ceiling', 'ceilings', 'tile', 'tiles', 'tiled', 'mosaic', 'pattern',
+    'shadow', 'shadows'
+}
+small_object_labels = {
+    'apple', 'tomato', 'cup', 'bowl', 'spoon', 'fork', 'knife', 'plate',
+    'remote', 'remotecontrol', 'watch', 'phone', 'cellphone', 'tablet',
+    'book', 'vase', 'kettle', 'mug', 'bottle', 'spraybottle'
+}
+large_object_labels = {
+    'wall', 'floor', 'ceiling', 'window', 'door', 'doorway', 'door frame',
+    'sofa', 'bed', 'chair', 'table', 'desk', 'countertop', 'cabinet',
+    'fridge', 'refrigerator', 'tv', 'painting', 'picture', 'picture frame'
+}
+internvl_max_num = int(os.environ.get("EFFICIENTNAV_INTERNVL_MAX_NUM", "6"))
+
+IMAGENET_MEAN = (0.485, 0.456, 0.406)
+IMAGENET_STD = (0.229, 0.224, 0.225)
+
+
+def get_object_scale_class(label):
+    normalized_label = canonical_goal_name(label)
+    if normalized_label in small_object_labels:
+        return "small"
+    if normalized_label in large_object_labels:
+        return "large"
+    return "medium"
+
+
+def adjust_visibility_thresholds_for_object(label, visible_ratio_threshold, min_bbox_side_px):
+    scale_class = get_object_scale_class(label)
+    if scale_class == "small":
+        return (
+            float(visible_ratio_threshold) * 0.6,
+            max(8, int(round(float(min_bbox_side_px) * 0.65))),
+        )
+    if scale_class == "large":
+        return (
+            float(visible_ratio_threshold) * 1.2,
+            max(1, int(round(float(min_bbox_side_px) * 1.1))),
+        )
+    return float(visible_ratio_threshold), int(min_bbox_side_px)
+
+
+def adjust_box_match_threshold_for_object(label, box_match_threshold):
+    scale_class = get_object_scale_class(label)
+    if scale_class == "small":
+        return max(0.005, float(box_match_threshold) * 0.75)
+    if scale_class == "large":
+        return min(0.5, float(box_match_threshold) * 1.1)
+    return float(box_match_threshold)
+
+
+def adjust_detection_min_side_for_object(label, min_side_px):
+    scale_class = get_object_scale_class(label)
+    if scale_class == "small":
+        return max(3, int(round(float(min_side_px) * 0.75)))
+    if scale_class == "large":
+        return max(1, int(round(float(min_side_px) * 1.2)))
+    return int(min_side_px)
+
+
+def is_preferred_planner_label(label, final_goal=None):
+    normalized_label = canonical_goal_name(label)
+    normalized_goal = canonical_goal_name(final_goal) if final_goal is not None else None
+    if normalized_goal and normalized_label == normalized_goal:
+        return True
+    return not is_low_value_planner_label(normalized_label, final_goal)
+
+
+def is_low_value_planner_label(label, final_goal=None):
+    normalized_label = canonical_goal_name(str(label or "").strip().lower())
+    normalized_goal = canonical_goal_name(final_goal) if final_goal is not None else None
+    if normalized_goal and normalized_label == normalized_goal:
+        return False
+    if normalized_label in transition_planner_labels:
+        return False
+    if normalized_label in low_value_planner_labels or normalized_label in observation_noise_labels:
+        return True
+    tokens = [token for token in re.split(r"[^a-z0-9]+", normalized_label) if token]
+    if not tokens:
+        return True
+    if any(token in {"door", "doorway", "window"} for token in tokens):
+        return False
+    non_structural_tokens = [
+        token for token in tokens
+        if token not in structural_subgoal_tokens
+    ]
+    return len(non_structural_tokens) == 0
+
+
+def get_text_similarity(text1, text2):
+    inputs1 = clip_tokenizer(text1, return_tensors='pt').to(device0)
+    inputs2 = clip_tokenizer(text2, return_tensors='pt').to(device0)
+    with torch.no_grad():
+        emb1 = model_clip(**inputs1).last_hidden_state.mean(dim=1)
+        emb2 = model_clip(**inputs2).last_hidden_state.mean(dim=1)
+        emb1 = emb1 / emb1.norm(dim=-1, keepdim=True)
+        emb2 = emb2 / emb2.norm(dim=-1, keepdim=True)
+    return float(1 - cosine(emb1[0].cpu().numpy(), emb2[0].cpu().numpy()))
+
+
+def get_planner_label_priority(label, final_goal=None):
+    normalized_label = canonical_goal_name(label)
+    normalized_goal = canonical_goal_name(final_goal) if final_goal is not None else None
+    if normalized_goal and normalized_label == normalized_goal:
+        return 10.0
+    score = get_text_similarity(normalized_label, normalized_goal or normalized_label)
+    if normalized_label in transition_planner_labels:
+        score += 0.15
+    if normalized_label in low_value_planner_labels:
+        score -= 0.25
+    return score
+
+
+def is_semantically_reasonable_planner_label(label, final_goal=None):
+    normalized_label = canonical_goal_name(label)
+    normalized_goal = canonical_goal_name(final_goal) if final_goal is not None else None
+    if normalized_goal and normalized_label == normalized_goal:
+        return True
+    if normalized_label in observation_noise_labels:
+        return False
+    if is_low_value_planner_label(normalized_label, final_goal):
+        return False
+    if normalized_label in trusted_planner_labels:
+        return True
+    if normalized_label in transition_planner_labels:
+        return True
+    return True
+
+
+def planner_label_match(observed_label, candidate_label):
+    observed = canonical_goal_name(str(observed_label or "").strip().lower())
+    candidate = canonical_goal_name(str(candidate_label or "").strip().lower())
+    if observed == candidate:
+        return True
+    alias_groups = [
+        {"table", "diningtable", "sidetable", "desk", "countertop"},
+        {"lamp", "desklamp", "floorlamp"},
+        {"picture", "picture frame", "painting"},
+        {"remote", "remotecontrol"},
+        {"door", "doorway", "door frame", "doorframe"},
+        {"tv", "television", "tvstand"},
+        {"plant", "houseplant", "potted plant"},
+        {"fridge", "refrigerator"},
+    ]
+    return any(observed in group and candidate in group for group in alias_groups)
+
+
+def order_detection_prompt_labels(labels, final_goal=None, limit=4):
+    normalized_labels = []
+    seen = set()
+    normalized_goal = canonical_goal_name(final_goal) if final_goal is not None else None
+    if normalized_goal:
+        normalized_labels.append(normalized_goal)
+        seen.add(normalized_goal)
+    for raw_label in labels:
+        normalized = canonical_goal_name(str(raw_label).strip().lower())
+        if not normalized or normalized in seen:
+            continue
+        if normalized in observation_noise_labels:
+            continue
+        normalized_labels.append(normalized)
+        seen.add(normalized)
+    normalized_labels.sort(
+        key=lambda label: (get_planner_label_priority(label, final_goal), label),
+        reverse=True,
+    )
+    if normalized_goal:
+        remaining_labels = [
+            label for label in normalized_labels
+            if label != normalized_goal
+        ]
+        remaining_labels.sort(
+            key=lambda label: (get_planner_label_priority(label, final_goal), label),
+            reverse=True,
+        )
+        return [normalized_goal] + remaining_labels[:max(0, limit - 1)]
+    return normalized_labels[:limit]
+
+
+def ensure_goal_name_registered(goal_name):
+    normalized_goal_name = canonical_goal_name(goal_name)
+    if normalized_goal_name not in final_goal_list:
+        final_goal_list.append(normalized_goal_name)
+    return normalized_goal_name
+
+
+def get_selectable_goal_names(scene):
+    selectable_goal_names = set()
+    for idx, obj in enumerate(scene.objects):
+        if idx == 0:
+            continue
+        selectable_goal_names.add(canonical_goal_name(obj.category.name()))
+    return sorted(selectable_goal_names)
+
+
+def choose_goal_name_for_house(scene):
+    selectable_goal_names = get_selectable_goal_names(scene)
+    print(
+        f"[Debug] selectable goal names count={len(selectable_goal_names)} "
+        f"sample={selectable_goal_names[:10]}"
+    )
+    if not selectable_goal_names:
+        print("[Debug] no selectable goal names found in semantic scene")
+        return None
+
+    requested_goal_name = os.environ.get("EFFICIENTNAV_TARGET_OBJECT")
+    if requested_goal_name not in (None, ""):
+        normalized_requested_goal = canonical_goal_name(requested_goal_name.strip())
+        if normalized_requested_goal in selectable_goal_names:
+            print(f"[Debug] using requested target object={normalized_requested_goal}")
+            return ensure_goal_name_registered(normalized_requested_goal)
+        print(
+            f"[Debug] requested EFFICIENTNAV_TARGET_OBJECT={requested_goal_name!r} "
+            f"not found in current house; skipping house"
+        )
+        return None
+
+    print("\nSelectable target objects in this house:")
+    for idx, goal_name in enumerate(selectable_goal_names, start=1):
+        print(f"  {idx}. {goal_name}")
+
+    while True:
+        selected_value = input("Choose target object by number or name: ").strip()
+        if not selected_value:
+            print("Please enter a number or object name.")
+            continue
+        if selected_value.isdigit():
+            selected_index = int(selected_value)
+            if 1 <= selected_index <= len(selectable_goal_names):
+                chosen_goal_name = selectable_goal_names[selected_index - 1]
+                print(f"[Debug] selected target object={chosen_goal_name}")
+                return ensure_goal_name_registered(chosen_goal_name)
+            print(f"Please choose a number between 1 and {len(selectable_goal_names)}.")
+            continue
+
+        normalized_selected_name = canonical_goal_name(selected_value)
+        if normalized_selected_name in selectable_goal_names:
+            print(f"[Debug] selected target object={normalized_selected_name}")
+            return ensure_goal_name_registered(normalized_selected_name)
+        print("That object is not in the current house list. Try again.")
+
+
+class DetectionROSClient(Node):
+    def __init__(self):
+        super().__init__("efficientnav_detection_client")
+        if DetectObjects is None:
+            raise RuntimeError(
+                "efficientnav_interfaces.srv.DetectObjects could not be imported. "
+                "source /home/min/DINO_ws/install/setup.bash before running EfficientNav."
+            )
+        self.detect_client = self.create_client(DetectObjects, "/detection/detect_objects")
+        while not self.detect_client.wait_for_service(timeout_sec=1.0):
+            print("[Debug] waiting for /detection/detect_objects service...")
+
+    def detect_objects(self, position_id, angle, prompt, image_np, timeout_sec=None):
+        if timeout_sec is None:
+            timeout_sec = ros2_detection_timeout_sec
+        request = DetectObjects.Request()
+        request.position_id = str(position_id)
+        request.angle = int(angle)
+        request.prompt = str(prompt)
+        request.height = int(image_np.shape[0])
+        request.width = int(image_np.shape[1])
+        request.encoding = "rgb8"
+        request.data = bytearray(image_np.astype(np.uint8).tobytes())
+        future = self.detect_client.call_async(request)
+        print(
+            f"[Debug] calling detection service: position_id={position_id} angle={int(angle)} "
+            f"prompt={prompt!r}"
+        )
+
+        deadline = time.time() + timeout_sec
+        while time.time() < deadline:
+            rclpy.spin_once(self, timeout_sec=0.1)
+            if future.done():
+                response = future.result()
+                if response is None:
+                    raise RuntimeError(
+                        f"Detection service call failed for position_id={position_id} angle={angle}"
+                    )
+                print(
+                    f"[Debug] received detection service result: position_id={position_id} "
+                    f"angle={int(angle)}"
+                )
+                return json.loads(response.result_json)
+        future.cancel()
+        raise TimeoutError(f"Timed out waiting for detection service result for {position_id=} {angle=}")
+
+
+_detection_ros_client = None
+
+
+def get_detection_ros_client():
+    global _detection_ros_client
+    if _detection_ros_client is None:
+        if not rclpy.ok():
+            rclpy.init(args=None)
+        _detection_ros_client = DetectionROSClient()
+    return _detection_ros_client
+
+
+def convert_ros_detection_payload_to_box_info_list(payload):
+    box_info_list = []
+    for detection in payload.get("detections", []):
+        label = str(detection.get("label", "")).strip()
+        box = detection.get("box", [])
+        if not label or len(box) != 4:
+            continue
+        box_info_list.append(
+            {
+                "label": label,
+                "box": [int(box[0]), int(box[1]), int(box[2]), int(box[3])],
+            }
+        )
+    return box_info_list
+
+
+def build_chat_prompt(user_text):
+    messages = [{"role": "user", "content": user_text}]
+    return planner_text_processor.apply_chat_template(
+        messages,
+        tokenize=False,
+        add_generation_prompt=True,
+    )
+
+
+def build_internvl_transform(input_size=448):
+    return T.Compose([
+        T.Lambda(lambda img: img.convert('RGB') if img.mode != 'RGB' else img),
+        T.Resize((input_size, input_size), interpolation=InterpolationMode.BICUBIC),
+        T.ToTensor(),
+        T.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
+    ])
+
+
+def _find_closest_aspect_ratio(aspect_ratio, target_ratios, width, height, image_size):
+    best_ratio_diff = float('inf')
+    best_ratio = (1, 1)
+    area = width * height
+    for ratio in target_ratios:
+        target_aspect_ratio = ratio[0] / ratio[1]
+        ratio_diff = abs(aspect_ratio - target_aspect_ratio)
+        if ratio_diff < best_ratio_diff:
+            best_ratio_diff = ratio_diff
+            best_ratio = ratio
+        elif ratio_diff == best_ratio_diff:
+            if area > 0.5 * image_size * image_size * ratio[0] * ratio[1]:
+                best_ratio = ratio
+    return best_ratio
+
+
+def dynamic_preprocess_internvl(image, min_num=1, max_num=6, image_size=448, use_thumbnail=True):
+    orig_width, orig_height = image.size
+    aspect_ratio = orig_width / orig_height
+    target_ratios = set(
+        (i, j)
+        for n in range(min_num, max_num + 1)
+        for i in range(1, n + 1)
+        for j in range(1, n + 1)
+        if i * j <= max_num and i * j >= min_num
+    )
+    target_ratios = sorted(target_ratios, key=lambda x: x[0] * x[1])
+    target_aspect_ratio = _find_closest_aspect_ratio(
+        aspect_ratio, target_ratios, orig_width, orig_height, image_size
+    )
+    target_width = image_size * target_aspect_ratio[0]
+    target_height = image_size * target_aspect_ratio[1]
+    blocks = target_aspect_ratio[0] * target_aspect_ratio[1]
+
+    resized_img = image.resize((target_width, target_height))
+    processed_images = []
+    for i in range(blocks):
+        box = (
+            (i % (target_width // image_size)) * image_size,
+            (i // (target_width // image_size)) * image_size,
+            ((i % (target_width // image_size)) + 1) * image_size,
+            ((i // (target_width // image_size)) + 1) * image_size,
+        )
+        processed_images.append(resized_img.crop(box))
+    if use_thumbnail and len(processed_images) != 1:
+        processed_images.append(image.resize((image_size, image_size)))
+    return processed_images
+
+
+def prepare_internvl_pixel_values(image, input_size=448, max_num=None):
+    max_num = internvl_max_num if max_num is None else max_num
+    transform = build_internvl_transform(input_size=input_size)
+    tiles = dynamic_preprocess_internvl(
+        image,
+        image_size=input_size,
+        use_thumbnail=True,
+        max_num=max_num,
+    )
+    pixel_values = torch.stack([transform(tile) for tile in tiles])
+    return pixel_values.to(device0, dtype=planner_chat_dtype)
+
+
+def query_planner_vlm(question, image=None, max_new_tokens=200):
+    if internvl_mode:
+        pixel_values = None
+        if image is not None:
+            pixel_values = prepare_internvl_pixel_values(image)
+            if "<image>" not in question:
+                question = "<image>\n" + question
+        ensure_internvl_context_token_id()
+        generation_config = dict(max_new_tokens=max_new_tokens, do_sample=False)
+        with torch.no_grad():
+            response = planner_model.chat(
+                planner_tokenizer,
+                pixel_values,
+                question,
+                generation_config,
+            )
+        if isinstance(response, tuple):
+            return response[0]
+        return response
+
+    if image is None:
+        prompt = build_chat_prompt(question)
+        inputs = planner_text_processor(prompt, padding=True, return_tensors="pt").to(device0)
+        with torch.no_grad():
+            if internvl_mode:
+                ensure_internvl_context_token_id()
+                output = planner_model.generate(
+                    input_ids=inputs["input_ids"],
+                    attention_mask=inputs.get("attention_mask"),
+                    max_new_tokens=max_new_tokens,
+                    do_sample=False,
+                    eos_token_id=list(get_planner_eos_token_ids()),
+                    pad_token_id=planner_tokenizer.pad_token_id,
+                )
+            else:
+                output = planner_model.generate(
+                    **inputs,
+                    max_new_tokens=max_new_tokens,
+                    pad_token_id=planner_tokenizer.pad_token_id,
+                )
+        generated = output[:, inputs["input_ids"].shape[1]:]
+        return planner_tokenizer.decode(generated[0], skip_special_tokens=True).strip()
+
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "image"},
+                {"type": "text", "text": question},
+            ],
+        }
+    ]
+    prompt = planner_processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    inputs = planner_processor(images=image, text=prompt, return_tensors="pt").to(device0)
+    with torch.no_grad():
+        output = planner_model.generate(**inputs, max_new_tokens=max_new_tokens, pad_token_id=planner_tokenizer.pad_token_id)
+    generated = output[:, inputs["input_ids"].shape[1]:]
+    return planner_tokenizer.decode(generated[0], skip_special_tokens=True).strip()
+
+
+def _normalize_observation_label(raw_label):
+    cleaned = re.sub(r"[^a-zA-Z0-9 ]+", " ", str(raw_label or "").strip().lower())
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    if not cleaned:
+        return None
+    if cleaned in {"none", "null", "n a", "na"}:
+        return None
+    if cleaned.isdigit():
+        return None
+    if cleaned in {"object", "objects", "angle"}:
+        return None
+    tokens = cleaned.split()
+    if len(tokens) > 10:
+        unique_ratio = len(set(tokens)) / max(len(tokens), 1)
+        if unique_ratio < 0.45:
+            return None
+        cleaned = " ".join(tokens[:10])
+    alias_map = {
+        "couch": "sofa",
+        "television": "tv",
+        "monitor": "tv",
+        "door": "doorway",
+        "doors": "doorway",
+        "door frame": "doorway",
+        "spray bottle": "spraybottle",
+        "spray": "spraybottle",
+        "teapot": "kettle",
+        "bucket": "pot",
+        "yellow couch": "sofa",
+        "green couch": "sofa",
+        "brown chair": "chair",
+        "white table": "diningtable",
+        "wooden stool": "stool",
+        "wooden box": "box",
+        "name door": "doorway",
+        "name television": "tv",
+        "name couch": "sofa",
+        "name table": "table",
+    }
+    return alias_map.get(cleaned, cleaned)
+
+
+def _split_numbered_observation(raw_label):
+    text = str(raw_label or "").strip()
+    if not re.search(r"(?:^|\s)\d+\s+[A-Za-z]", text):
+        return [text]
+    parts = []
+    matches = list(re.finditer(r"(?:^|\s)(\d+)\s+", text))
+    for idx, match in enumerate(matches):
+        start = match.end()
+        end = matches[idx + 1].start() if idx + 1 < len(matches) else len(text)
+        part = text[start:end].strip(" ,.;")
+        if part:
+            parts.append(part)
+    return parts or [text]
+
+
+def normalize_observation_objects(objects):
+    if isinstance(objects, str):
+        objects = [objects]
+    normalized_objects = []
+    seen = set()
+    for obj in objects:
+        for candidate in _split_numbered_observation(obj):
+            normalized = _normalize_observation_label(candidate)
+            if normalized and normalized not in seen:
+                normalized_objects.append(normalized)
+                seen.add(normalized)
+    return normalized_objects[:4]
+
+
+def parse_observation_response(raw_text, angle):
+    raw_text = str(raw_text or "").strip()
+
+    start = raw_text.find("{")
+    end = raw_text.rfind("}") + 1
+    if start != -1 and end > start:
+        try:
+            data = json.loads(raw_text[start:end])
+            objects = data.get("Objects", [])
+            normalized_objects = normalize_observation_objects(objects)
+            return {"Angle": angle, "Objects": normalized_objects[:4]}
+        except Exception:
+            pass
+
+    extracted_objects = []
+    seen = set()
+    for line in raw_text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        if ":" in line:
+            _, value = line.split(":", 1)
+            candidates = re.split(r",|\band\b", value)
+        else:
+            candidates = re.split(r",|\band\b", line)
+        for candidate in candidates:
+            for split_candidate in _split_numbered_observation(candidate):
+                normalized = _normalize_observation_label(split_candidate)
+                if not normalized:
+                    continue
+                if normalized.startswith("angle "):
+                    continue
+                if normalized.startswith("objects "):
+                    normalized = _normalize_observation_label(normalized[len("objects "):])
+                if normalized and normalized not in seen:
+                    extracted_objects.append(normalized)
+                    seen.add(normalized)
+
+    if extracted_objects:
+        return {"Angle": angle, "Objects": extracted_objects[:4]}
+
+    return None
+
+
+def parse_planner_response(raw_text, allowed_objects_by_place, final_goal):
+    raw_text = str(raw_text or "").strip()
+    allowed_label_to_places = {}
+    for place_idx, labels in allowed_objects_by_place.items():
+        for label in labels:
+            normalized_label = canonical_goal_name(label)
+            allowed_label_to_places.setdefault(normalized_label, []).append(int(place_idx))
+
+    def infer_allowed_label_from_text(text):
+        lowered = str(text or "").lower()
+        best_label = None
+        best_pos = None
+        for label in allowed_label_to_places:
+            pos = lowered.find(label.lower())
+            if pos == -1:
+                continue
+            if best_pos is None or pos < best_pos:
+                best_pos = pos
+                best_label = label
+        return best_label
+
+    def sanitize_choice(place_value, angle_value, objects_value, fallback_text=""):
+        normalized_place = None
+        try:
+            normalized_place = int(place_value)
+        except Exception:
+            normalized_place = None
+
+        try:
+            normalized_angle = int(angle_value)
+        except Exception:
+            normalized_angle = 0
+
+        if isinstance(objects_value, str):
+            objects_list = [objects_value]
+        elif isinstance(objects_value, list):
+            objects_list = objects_value
+        else:
+            objects_list = []
+
+        normalized_objects = [
+            canonical_goal_name(str(obj).strip().lower())
+            for obj in objects_list
+            if str(obj).strip()
+        ]
+
+        if normalized_place is not None and normalized_place in allowed_objects_by_place:
+            allowed_labels = [
+                canonical_goal_name(label)
+                for label in allowed_objects_by_place.get(normalized_place, [])
+            ]
+            for obj_label in normalized_objects:
+                if obj_label in allowed_labels:
+                    return {"Place": normalized_place, "Angle": normalized_angle, "Objects": [obj_label]}
+            inferred_from_objects = None
+            for raw_obj in objects_list:
+                inferred_from_objects = infer_allowed_label_from_text(raw_obj)
+                if inferred_from_objects is not None and inferred_from_objects in allowed_labels:
+                    return {"Place": normalized_place, "Angle": normalized_angle, "Objects": [inferred_from_objects]}
+            if allowed_labels:
+                return {"Place": normalized_place, "Angle": normalized_angle, "Objects": [allowed_labels[0]]}
+
+        combined_text = " ".join([fallback_text] + [str(obj) for obj in objects_list])
+        inferred_label = infer_allowed_label_from_text(combined_text)
+        if inferred_label is not None:
+            return {"Place": allowed_label_to_places[inferred_label][0], "Angle": normalized_angle, "Objects": [inferred_label]}
+
+        if canonical_goal_name(final_goal) in allowed_label_to_places:
+            goal_label = canonical_goal_name(final_goal)
+            if goal_label in combined_text.lower():
+                return {"Place": allowed_label_to_places[goal_label][0], "Angle": normalized_angle, "Objects": [goal_label]}
+
+        for place_idx, labels in allowed_objects_by_place.items():
+            if labels:
+                return {"Place": int(place_idx), "Angle": normalized_angle, "Objects": [canonical_goal_name(labels[0])]}
+        return None
+
+    start = raw_text.find("{")
+    end = raw_text.rfind("}") + 1
+    if start != -1 and end > start:
+        try:
+            parsed = json.loads(raw_text[start:end])
+            sanitized = sanitize_choice(
+                parsed.get("Place"),
+                parsed.get("Angle", 0),
+                parsed.get("Objects", []),
+                fallback_text=raw_text,
+            )
+            if sanitized is not None:
+                return sanitized
+        except Exception:
+            pass
+
+    lowered_text = raw_text.lower()
+    if canonical_goal_name(final_goal) in allowed_label_to_places and canonical_goal_name(final_goal) in lowered_text:
+        goal_label = canonical_goal_name(final_goal)
+        return {"Place": allowed_label_to_places[goal_label][0], "Angle": 0, "Objects": [goal_label]}
+
+    best_label = infer_allowed_label_from_text(lowered_text)
+    if best_label is not None:
+        return {"Place": allowed_label_to_places[best_label][0], "Angle": 0, "Objects": [best_label]}
+
+    for place_idx, labels in allowed_objects_by_place.items():
+        if labels:
+            return {"Place": place_idx, "Angle": 0, "Objects": [labels[0]]}
+
+    return None
+
+
+def parse_planner_response_strict(raw_text):
+    raw_text = str(raw_text or "").strip()
+    start = raw_text.find("{")
+    end = raw_text.rfind("}") + 1
+    if start == -1 or end <= start:
+        return None
+    try:
+        parsed = json.loads(raw_text[start:end])
+        place = int(parsed.get("Place"))
+        angle = int(parsed.get("Angle", 0))
+        objects = parsed.get("Objects", [])
+    except Exception:
+        return None
+
+    if isinstance(objects, str):
+        objects = [objects]
+    if not isinstance(objects, list):
+        return None
+    cleaned_objects = [
+        canonical_goal_name(str(obj).strip().lower())
+        for obj in objects
+        if str(obj).strip()
+    ]
+    if not cleaned_objects:
+        return None
+    return {"Place": place, "Angle": angle, "Objects": [cleaned_objects[0]]}
+
+
+def parse_planner_response_minimal(raw_text):
+    raw_text = str(raw_text or "").strip()
+    start = raw_text.find("{")
+    end = raw_text.rfind("}") + 1
+    if start == -1 or end <= start:
+        return None
+    try:
+        parsed = json.loads(raw_text[start:end])
+    except Exception:
+        return None
+
+    raw_place = parsed.get("Place")
+    try:
+        place = int(raw_place)
+        raw_place_label = None
+    except Exception:
+        place = None
+        raw_place_label = canonical_goal_name(str(raw_place).strip().lower()) if raw_place is not None else None
+
+    try:
+        angle = int(parsed.get("Angle", 0))
+    except Exception:
+        angle = 0
+
+    objects = parsed.get("Objects", [])
+    if isinstance(objects, str):
+        objects = [objects]
+    if not isinstance(objects, list):
+        objects = []
+
+    cleaned_objects = [
+        canonical_goal_name(str(obj).strip().lower())
+        for obj in objects
+        if str(obj).strip()
+    ]
+    if raw_place_label:
+        cleaned_objects = [raw_place_label] + cleaned_objects
+
+    if not cleaned_objects:
+        return None
+    return {"Place": place, "Angle": angle, "Objects": cleaned_objects}
+
+
+def resolve_minimal_llm_choice(planner_choice, allowed_targets_by_place):
+    if planner_choice is None:
+        return None
+
+    raw_objects = planner_choice.get("Objects", [])
+    if isinstance(raw_objects, str):
+        raw_objects = [raw_objects]
+    requested_labels = [
+        canonical_goal_name(str(obj).strip().lower())
+        for obj in raw_objects
+        if str(obj).strip()
+    ]
+    if not requested_labels:
+        return None
+
+    try:
+        requested_place = int(planner_choice.get("Place"))
+    except Exception:
+        requested_place = None
+
+    try:
+        requested_angle = int(planner_choice.get("Angle", 0))
+    except Exception:
+        requested_angle = 0
+
+    if requested_place is not None:
+        place_targets = allowed_targets_by_place.get(requested_place, [])
+        for label in requested_labels:
+            for candidate in place_targets:
+                if canonical_goal_name(candidate[0]) == label and int(candidate[1]) == requested_angle:
+                    return {"Place": requested_place, "Angle": int(candidate[1]), "Objects": [label]}
+            for candidate in place_targets:
+                if canonical_goal_name(candidate[0]) == label:
+                    return {"Place": requested_place, "Angle": int(candidate[1]), "Objects": [label]}
+
+    for label in requested_labels:
+        for place_idx, place_targets in allowed_targets_by_place.items():
+            for candidate in place_targets:
+                if canonical_goal_name(candidate[0]) == label and int(candidate[1]) == requested_angle:
+                    return {"Place": int(place_idx), "Angle": int(candidate[1]), "Objects": [label]}
+        for place_idx, place_targets in allowed_targets_by_place.items():
+            for candidate in place_targets:
+                if canonical_goal_name(candidate[0]) == label:
+                    return {"Place": int(place_idx), "Angle": int(candidate[1]), "Objects": [label]}
+
+    return None
+
+
+def save_goal_bbox_debug(color_image, semantic_frame, object_id, label, output_path):
+    mask = semantic_frame == object_id
+    if not np.any(mask):
+        return False
+    ys, xs = np.where(mask)
+    x1, x2 = int(xs.min()), int(xs.max())
+    y1, y2 = int(ys.min()), int(ys.max())
+    image = I.fromarray(color_image.astype(np.uint8))
+    draw = ImageDraw.Draw(image)
+    draw.rectangle([x1, y1, x2, y2], outline=(255, 0, 0), width=4)
+    draw.text((x1, max(0, y1 - 18)), label, fill=(255, 0, 0))
+    image.save(output_path)
+    return True
+
+
+def get_object_visibility_metrics(semantic_frame, object_id):
+    mask = semantic_frame == object_id
+    if not np.any(mask):
+        return 0.0, 0, 0
+    visible_ratio = float(np.mean(mask))
+    ys, xs = np.where(mask)
+    bbox_width = int(xs.max() - xs.min() + 1)
+    bbox_height = int(ys.max() - ys.min() + 1)
+    return visible_ratio, bbox_width, bbox_height
+
+
+def is_object_clearly_visible(semantic_frame, object_id, visible_ratio_threshold, min_bbox_side_px):
+    visible_ratio, bbox_width, bbox_height = get_object_visibility_metrics(semantic_frame, object_id)
+    is_visible = (
+        visible_ratio >= visible_ratio_threshold
+        and bbox_width >= min_bbox_side_px
+        and bbox_height >= min_bbox_side_px
+    )
+    return is_visible, visible_ratio, bbox_width, bbox_height
+
+
+def is_goal_label_match(goal_name, detected_label):
+    return canonical_goal_name(detected_label) == canonical_goal_name(goal_name)
+
+
+SMALL_GOAL_LABELS = {
+    "laptop", "phone", "cellphone", "tablet", "cup", "remote", "remotecontrol",
+    "book", "bottle", "mug", "kettle", "spraybottle", "box", "statue", "watch"
+}
+
+LARGE_GOAL_LABELS = {
+    "bed", "sofa", "chair", "armchair", "toilet",
+    "refrigerator", "fridge", "cabinet", "table", "diningtable", "desk", "tv", "television"
+}
+
+DEFAULT_GOAL_LABELS = {
+    "plant", "floorlamp", "lamp", "desklamp"
+}
+
+
+def _get_env_float(name, default_value):
+    try:
+        return float(os.environ.get(name, str(default_value)))
+    except (TypeError, ValueError):
+        print(f"[Debug] invalid float env {name}={os.environ.get(name)!r}; using default={default_value}")
+        return float(default_value)
+
+
+def _get_env_int(name, default_value):
+    try:
+        return int(os.environ.get(name, str(default_value)))
+    except (TypeError, ValueError):
+        print(f"[Debug] invalid int env {name}={os.environ.get(name)!r}; using default={default_value}")
+        return int(default_value)
+
+
+def get_goal_size_class(goal_name):
+    normalized_goal = canonical_goal_name(str(goal_name or "").strip().lower())
+    if normalized_goal in SMALL_GOAL_LABELS:
+        return "small"
+    if normalized_goal in LARGE_GOAL_LABELS:
+        return "large"
+    if normalized_goal in DEFAULT_GOAL_LABELS:
+        return "default"
+    return "default"
+
+
+def get_goal_success_thresholds(goal_name):
+    """Return semantic success and RGB-detector thresholds for a final goal."""
+    size_class = get_goal_size_class(goal_name)
+    if size_class == "small":
+        semantic_visible_ratio = _get_env_float("EFFICIENTNAV_SMALL_GOAL_VISIBLE_RATIO", 0.0003)
+        semantic_min_bbox_side = _get_env_int("EFFICIENTNAV_SMALL_GOAL_MIN_BBOX_SIDE", 12)
+        rgb_min_bbox_side = _get_env_int("EFFICIENTNAV_SMALL_GOAL_RGB_MIN_BBOX_SIDE", 16)
+    elif size_class == "large":
+        semantic_visible_ratio = _get_env_float(
+            "EFFICIENTNAV_LARGE_GOAL_VISIBLE_RATIO",
+            _get_env_float("EFFICIENTNAV_GOAL_SUCCESS_VISIBLE_RATIO_THRESHOLD", 0.008),
+        )
+        semantic_min_bbox_side = _get_env_int(
+            "EFFICIENTNAV_LARGE_GOAL_MIN_BBOX_SIDE",
+            _get_env_int("EFFICIENTNAV_GOAL_SUCCESS_MIN_BBOX_SIDE_PX", 80),
+        )
+        rgb_min_bbox_side = _get_env_int(
+            "EFFICIENTNAV_LARGE_GOAL_RGB_MIN_BBOX_SIDE",
+            _get_env_int("EFFICIENTNAV_MIN_DETECTED_GOAL_BBOX_SIDE_PX", 80),
+        )
+    else:
+        semantic_visible_ratio = _get_env_float("EFFICIENTNAV_DEFAULT_GOAL_VISIBLE_RATIO", 0.002)
+        semantic_min_bbox_side = _get_env_int("EFFICIENTNAV_DEFAULT_GOAL_MIN_BBOX_SIDE", 32)
+        rgb_min_bbox_side = _get_env_int("EFFICIENTNAV_DEFAULT_GOAL_RGB_MIN_BBOX_SIDE", 40)
+    return {
+        "size_class": size_class,
+        "semantic_visible_ratio": semantic_visible_ratio,
+        "semantic_min_bbox_side": semantic_min_bbox_side,
+        "rgb_min_bbox_side": rgb_min_bbox_side,
+    }
+
+
+def get_goal_candidate_thresholds(goal_name):
+    """Return semantic/RGB thresholds used to preserve goal candidates in get_objects()."""
+    size_class = get_goal_size_class(goal_name)
+    if size_class == "small":
+        visible_ratio = _get_env_float("EFFICIENTNAV_SMALL_GOAL_CANDIDATE_VISIBLE_RATIO", 0.0001)
+        min_bbox_side = _get_env_int("EFFICIENTNAV_SMALL_GOAL_CANDIDATE_MIN_BBOX_SIDE", 6)
+        box_match_ratio = _get_env_float("EFFICIENTNAV_SMALL_GOAL_CANDIDATE_BOX_MATCH_RATIO", 0.005)
+        detection_min_side = _get_env_int("EFFICIENTNAV_SMALL_GOAL_CANDIDATE_DETECTION_MIN_SIDE", 2)
+    elif size_class == "large":
+        visible_ratio = _get_env_float("EFFICIENTNAV_LARGE_GOAL_CANDIDATE_VISIBLE_RATIO", 0.001)
+        min_bbox_side = _get_env_int("EFFICIENTNAV_LARGE_GOAL_CANDIDATE_MIN_BBOX_SIDE", 24)
+        box_match_ratio = _get_env_float("EFFICIENTNAV_LARGE_GOAL_CANDIDATE_BOX_MATCH_RATIO", 0.02)
+        detection_min_side = _get_env_int("EFFICIENTNAV_LARGE_GOAL_CANDIDATE_DETECTION_MIN_SIDE", 8)
+    else:
+        visible_ratio = _get_env_float("EFFICIENTNAV_DEFAULT_GOAL_CANDIDATE_VISIBLE_RATIO", 0.0005)
+        min_bbox_side = _get_env_int("EFFICIENTNAV_DEFAULT_GOAL_CANDIDATE_MIN_BBOX_SIDE", 16)
+        box_match_ratio = _get_env_float("EFFICIENTNAV_DEFAULT_GOAL_CANDIDATE_BOX_MATCH_RATIO", 0.01)
+        detection_min_side = _get_env_int("EFFICIENTNAV_DEFAULT_GOAL_CANDIDATE_DETECTION_MIN_SIDE", 3)
+    return {
+        "size_class": size_class,
+        "visible_ratio": visible_ratio,
+        "min_bbox_side": min_bbox_side,
+        "box_match_ratio": box_match_ratio,
+        "detection_min_side": detection_min_side,
+    }
+
+
+def detect_goal_in_current_view(color_image, goal_name, request_id, angle):
+    prompt = f"{goal_name.lower()} ."
+    goal_thresholds = get_goal_success_thresholds(goal_name)
+    min_detected_goal_bbox_side_px = int(goal_thresholds["rgb_min_bbox_side"])
+    if use_ros2_detection:
+        ros_client = get_detection_ros_client()
+        payload = ros_client.detect_objects(request_id, angle, prompt, color_image.astype(np.uint8))
+        box_info_list = convert_ros_detection_payload_to_box_info_list(payload)
+    else:
+        image_path = f"tmp/navigation_images/{request_id}_goal_check.png"
+        imageio.imwrite(image_path, color_image)
+        image_pil, image = load_image(image_path)
+        boxes_filt, pred_phrases = get_grounding_output(
+            model_dino,
+            image,
+            prompt,
+            box_threshold,
+            text_threshold,
+            cpu_only=not cuda_available,
+            token_spans=eval(f"{token_spans}") if token_spans is not None else None,
+            text_prompt=goal_name,
+        )
+        size = image_pil.size
+        pred_dict = {
+            "boxes": boxes_filt,
+            "size": [size[1], size[0]],
+            "labels": pred_phrases,
+        }
+        _, _, box_info_list = plot_boxes_to_image(image_pil, pred_dict)
+
+    best_detection = None
+    best_area = 0
+    for box_info in box_info_list:
+        label = str(box_info.get("label", "")).strip().lower()
+        if not is_goal_label_match(goal_name, label):
+            continue
+        box = box_info.get("box", [])
+        if len(box) != 4:
+            continue
+        width = max(0, int(box[2]) - int(box[0]))
+        height = max(0, int(box[3]) - int(box[1]))
+        if width < min_detected_goal_bbox_side_px or height < min_detected_goal_bbox_side_px:
+            continue
+        area = width * height
+        if area > best_area:
+            best_area = area
+            best_detection = {
+                "label": label,
+                "box": [int(box[0]), int(box[1]), int(box[2]), int(box[3])],
+                "width": width,
+                "height": height,
+            }
+    return best_detection
+
+
+def convert_legacy_kv_to_runtime_cache(cache_value):
+    if cache_value is None or DynamicCache is None:
+        return cache_value
+    if not isinstance(cache_value, tuple):
+        return cache_value
+    runtime_cache = DynamicCache()
+    for layer_idx, layer_cache in enumerate(cache_value):
+        if not isinstance(layer_cache, tuple) or len(layer_cache) != 2:
+            raise TypeError(f"invalid legacy cache entry at layer {layer_idx}")
+        key_states, value_states = layer_cache
+        runtime_cache.update(key_states, value_states, layer_idx)
+    return runtime_cache
+
+
+def convert_runtime_kv_to_legacy_cache(cache_value):
+    if cache_value is None or isinstance(cache_value, tuple):
+        return cache_value
+    if hasattr(cache_value, "to_legacy_cache"):
+        return cache_value.to_legacy_cache()
+    return cache_value
+
+
+def get_kv_cache_seq_len(cache_value):
+    legacy_cache = convert_runtime_kv_to_legacy_cache(cache_value)
+    if not isinstance(legacy_cache, tuple) or not legacy_cache:
+        return None
+    try:
+        return int(legacy_cache[0][0].shape[-2])
+    except Exception:
+        return None
+
+
+def get_observation(images,depth):
+    if not planner_supports_vision:
+        detection_answers = []
+        position_looked = []
+        for i in range(0,4):
+            if depth[i].mean() <= depth_threshould:
+                print(f"[Debug] get_observation skip angle={i * 90} reason=depth")
+                continue
+            position_looked.append(i * 90)
+            detection_answers.append(json.dumps({"Angle": i * 90, "Objects": ["door frame"]}, indent=4))
+        return detection_answers, position_looked
+
+    observation_instruction = '''You need to make a purposeful observation of the image from the current perspective.
+Then describe the main larger solid objects in the image in a short statement and follow the following format:
+{ "Angle": 0, "Objects": ["Object name", "Object name"] }
+Here are some things you should be aware of:
+1. Entrances or doorways to other spaces in the room count as objects, which you need to describe. But do not describe doors.
+2. Objects that are too small need no description.
+3. You should describe the same object only once. You can describe 4 objects in the image at most.
+4. Only output description follow the format, other content is not output.
+5. Do not describe objects in the mirror.'''
+
+    llm_answer = []
+    for image in images:
+        real_output = query_planner_vlm(observation_instruction, image=image, max_new_tokens=200)
+        llm_answer.append(real_output.strip())
+
+    llm_answer1 = []
+    json_data = llm_answer
+    num_look = 4
+    position_unlooked = []
+    position_looked = []
+    for i in range(0,4):
+        if depth[i].mean() <= depth_threshould:
+            num_look -= 1
+            position_unlooked.append(i*90)
+            print(f"[Debug] get_observation skip angle={i * 90} reason=depth")
+            continue
+        else:
+            position_looked.append(i*90)
+        data = parse_observation_response(json_data[i], i * 90)
+        if data is None:
+            print(f"[Debug] get_observation skip angle={i * 90} reason=json_parse raw={json_data[i]!r}")
+            if position_looked and position_looked[-1] == i * 90:
+                position_looked.pop()
+            continue
+        json_string = json.dumps(data, indent=4)
+        if i==0:
+            llm_answer1.append(json_string)
+        else:
+            llm_answer1.append(json_string)
+    return llm_answer1,position_looked
+
+
+def get_objects_boxes(llava_answer1,fig_name,final_goal=None):
+    global text_threshold
+    box_info_list_sum = []
+    json_objects = copy.deepcopy(llava_answer1)
+    # Parse each JSON object and store in a dictionary
+    angles_objects = {}
+    for json_obj in json_objects:
+        obj_dict = json.loads(json_obj)
+        angle = obj_dict['Angle']
+        objects = obj_dict['Objects']
+        angles_objects[angle] = objects
+    for i, (text_prompt_list, key_angle) in enumerate(zip(angles_objects.values(),angles_objects.keys())):
+        image_path = f"navigation_images/{fig_name}+surroundings_angle_{key_angle}.png"
+        text_prompt_list = order_detection_prompt_labels(text_prompt_list, final_goal=final_goal, limit=4)
+        if len(text_prompt_list) == 0:
+            box_info_list_sum.append([])
+            continue
+        text_prompt = text_prompt_list[0]
+        result = ' . '.join([obj.lower() for obj in text_prompt_list]) + ' .'
+        image_pil, image = load_image(image_path)
+        image_pil.save(os.path.join(output_dir, f"raw_image_angle_{i}.jpg"))
+        if use_ros2_detection:
+            ros_client = get_detection_ros_client()
+            image_np = np.array(image_pil, dtype=np.uint8)
+            position_id = fig_name
+            payload = ros_client.detect_objects(position_id, key_angle, result, image_np)
+            box_info_list = convert_ros_detection_payload_to_box_info_list(payload)
+            image_with_box = image_pil
+        else:
+            if token_spans is not None:
+                text_threshold = None
+                print("Using token_spans. Set the text_threshold to None.")
+            boxes_filt, pred_phrases = get_grounding_output(
+                model_dino, image, result, box_threshold, text_threshold, cpu_only=False, token_spans=eval(f"{token_spans}"),text_prompt=text_prompt
+            )
+            size = image_pil.size
+            pred_dict = {
+                "boxes": boxes_filt,
+                "size": [size[1], size[0]],  # H,W
+                "labels": pred_phrases,
+            }
+
+            image_with_box, _ , box_info_list = plot_boxes_to_image(image_pil, pred_dict)
+        normalized_box_info_list = []
+        for box_info in box_info_list:
+            normalized_label = _normalize_observation_label(box_info.get('label', ''))
+            if not normalized_label:
+                continue
+            normalized_box_info_list.append(
+                {
+                    "label": normalized_label,
+                    "box": box_info["box"],
+                }
+            )
+        box_info_list_copy = copy.deepcopy(normalized_box_info_list)
+        box_info_list_flag = np.zeros(len(box_info_list_copy))
+        box_info_list_real = []
+        for j in range (0,len(box_info_list_copy)):
+            if box_info_list_flag[j] ==1:
+                continue
+            if j == len(box_info_list_copy)-1:
+                box_info_list_real.append(box_info_list_copy[j])
+                break
+            for k in range(j+1,len(box_info_list_copy)):
+                if box_info_list_copy[j]['label'] == box_info_list_copy[k]['label']:
+                    box_info_list_copy[j]['box'][0] = min(box_info_list_copy[j]['box'][0],box_info_list_copy[k]['box'][0])
+                    box_info_list_copy[j]['box'][1] = min(box_info_list_copy[j]['box'][1],box_info_list_copy[k]['box'][1])
+                    box_info_list_copy[j]['box'][2] = max(box_info_list_copy[j]['box'][2],box_info_list_copy[k]['box'][2])
+                    box_info_list_copy[j]['box'][3] = max(box_info_list_copy[j]['box'][3],box_info_list_copy[k]['box'][3])
+                    box_info_list_flag[k] = 1
+            box_info_list_real.append(box_info_list_copy[j])
+
+        # If Grounding DINO did not return a box for a requested label, do not
+        # synthesize a full-image fallback box. Those oversized boxes dominate
+        # the semantic/CLIP matching stage and bias candidates toward
+        # window/wall/doorway artifacts.
+
+        del_tmp = []
+        for j in range(0,len(box_info_list_real)):
+            text_exist_flag = 0
+            for k in range(0,len(text_prompt_list)):
+                if canonical_goal_name(box_info_list_real[j]['label'].lower()) == canonical_goal_name(text_prompt_list[k].lower()) :
+                    text_exist_flag =1
+                    break
+            if text_exist_flag == 0:
+                del_tmp.append(j)
+        del_tmp.sort(reverse=True)
+        for j in range(len(del_tmp)):
+            del box_info_list_real[del_tmp[j]]
+        box_info_list_sum.append(box_info_list_real)
+        image_with_box.save(os.path.join(output_dir, f"pred_angle_{i}.jpg"))
+    return box_info_list_sum
+
+
+def get_objects(topomap,scene,position_looked,box_info_list_sum,semantic_observations,obj_dict,final_goal=None):
+    ObjectInfo = namedtuple("ObjectInfo", ["label","angle", "obj_id", "category", "center", "sizes"])
+
+    objects_info_filtered = []
+    max_similar_objs_list = []
+    normalized_final_goal = canonical_goal_name(final_goal) if final_goal is not None else None
+    grounded_visible_ratio_threshold = float(
+        os.environ.get("EFFICIENTNAV_GROUNDED_VISIBLE_RATIO_THRESHOLD", "0.002")
+    )
+    grounded_min_bbox_side_px = int(
+        os.environ.get("EFFICIENTNAV_GROUNDED_MIN_BBOX_SIDE_PX", "24")
+    )
+    grounded_box_match_ratio_threshold = float(
+        os.environ.get("EFFICIENTNAV_GROUNDED_BOX_MATCH_RATIO_THRESHOLD", "0.08")
+    )
+    goal_candidate_thresholds = get_goal_candidate_thresholds(normalized_final_goal)
+    goal_candidate_visible_ratio_threshold = float(goal_candidate_thresholds["visible_ratio"])
+    goal_candidate_min_bbox_side_px = int(goal_candidate_thresholds["min_bbox_side"])
+    goal_candidate_box_match_ratio_threshold = float(goal_candidate_thresholds["box_match_ratio"])
+    goal_candidate_detection_min_side_px = int(goal_candidate_thresholds["detection_min_side"])
+    if normalized_final_goal is not None:
+        print(
+            f"[Debug] goal candidate thresholds: goal={normalized_final_goal} "
+            f"size_class={goal_candidate_thresholds['size_class']} "
+            f"visible_ratio={goal_candidate_visible_ratio_threshold} "
+            f"min_bbox_side={goal_candidate_min_bbox_side_px} "
+            f"box_match_ratio={goal_candidate_box_match_ratio_threshold} "
+            f"detection_min_side={goal_candidate_detection_min_side_px}"
+        )
+    current_position = np.array(topomap.now.position if topomap.now is not None else [0.0, 0.0, 0.0])
+    empty_position = []
+    for i,(angle_picture, box_info_list) in enumerate(zip(position_looked,box_info_list_sum)):
+        topomap.now.similarity.append([0.0 for _ in range(len(final_goal_list))])
+        empty_flag = 0
+        semantic = semantic_observations[angle_picture//90]
+        for box_info in box_info_list:
+            label = canonical_goal_name(box_info['label'].lower())
+            if label in observation_noise_labels:
+                continue
+            label_grounded_visible_ratio_threshold, label_grounded_min_bbox_side_px = (
+                adjust_visibility_thresholds_for_object(
+                    label,
+                    grounded_visible_ratio_threshold,
+                    grounded_min_bbox_side_px,
+                )
+            )
+            label_goal_candidate_visible_ratio_threshold, label_goal_candidate_min_bbox_side_px = (
+                adjust_visibility_thresholds_for_object(
+                    label,
+                    goal_candidate_visible_ratio_threshold,
+                    goal_candidate_min_bbox_side_px,
+                )
+            )
+            label_grounded_box_match_ratio_threshold = adjust_box_match_threshold_for_object(
+                label,
+                grounded_box_match_ratio_threshold,
+            )
+            label_goal_candidate_box_match_ratio_threshold = adjust_box_match_threshold_for_object(
+                label,
+                goal_candidate_box_match_ratio_threshold,
+            )
+            label_goal_candidate_detection_min_side_px = adjust_detection_min_side_for_object(
+                label,
+                goal_candidate_detection_min_side_px,
+            )
+            x1, y1, x2, y2 = box_info['box']
+            detected_box_width = max(0, int(x2) - int(x1))
+            detected_box_height = max(0, int(y2) - int(y1))
+            semantic_box = semantic[y1:y2, x1:x2]
+            unique_labels = np.unique(semantic_box)
+            filtered_objects = []
+            goal_candidate_matched = False
+            semantic_overlap_debug = []
+            for label_id in unique_labels:
+                if int(label_id) == 0:
+                    continue
+                box_match_ratio = float(np.mean(semantic_box == label_id))
+                obj = scene.objects[label_id]
+                category_name = canonical_goal_name(obj.category.name().lower())
+                semantic_overlap_debug.append(
+                    (
+                        category_name,
+                        int(label_id),
+                        box_match_ratio,
+                        obj.obb.center,
+                    )
+                )
+                is_goal_candidate = (
+                    normalized_final_goal is not None
+                    and label == normalized_final_goal
+                    and category_name == normalized_final_goal
+                )
+                visible_threshold = (
+                    label_goal_candidate_visible_ratio_threshold
+                    if is_goal_candidate
+                    else label_grounded_visible_ratio_threshold
+                )
+                min_bbox_side_px = (
+                    label_goal_candidate_min_bbox_side_px
+                    if is_goal_candidate
+                    else label_grounded_min_bbox_side_px
+                )
+                box_match_threshold = (
+                    label_goal_candidate_box_match_ratio_threshold
+                    if is_goal_candidate
+                    else label_grounded_box_match_ratio_threshold
+                )
+                is_clearly_visible, visible_ratio, bbox_width, bbox_height = is_object_clearly_visible(
+                    semantic,
+                    int(label_id),
+                    visible_threshold,
+                    min_bbox_side_px,
+                )
+                goal_box_overlap_visible = (
+                    is_goal_candidate
+                    and box_match_ratio >= box_match_threshold
+                    and detected_box_width >= label_goal_candidate_detection_min_side_px
+                    and detected_box_height >= label_goal_candidate_detection_min_side_px
+                )
+                if (
+                    box_match_ratio < box_match_threshold
+                    or (not is_clearly_visible and not goal_box_overlap_visible)
+                ):
+                    continue
+                if category_name in observation_noise_labels:
+                    continue
+                if is_goal_candidate:
+                    goal_candidate_matched = True
+                    print(
+                        f"[Debug] preserving goal candidate: label={label} angle={angle_picture} "
+                        f"obj_id={int(label_id)} visible_ratio={visible_ratio:.6f} "
+                        f"bbox={bbox_width}x{bbox_height} box_match={box_match_ratio:.4f} "
+                        f"detection_bbox={detected_box_width}x{detected_box_height}"
+                    )
+                object_info_filtered = ObjectInfo(
+                    label=label,
+                    angle=angle_picture,
+                    obj_id=label_id,
+                    category=category_name,
+                    center=obj.obb.center,
+                    sizes=obj.obb.sizes
+                )
+                objects_info_filtered.append(object_info_filtered)
+                filtered_objects.append(object_info_filtered)
+
+            if (
+                normalized_final_goal is not None
+                and label == normalized_final_goal
+                and not goal_candidate_matched
+            ):
+                semantic_overlap_debug.sort(key=lambda item: item[2], reverse=True)
+                top_overlaps = semantic_overlap_debug[:5]
+                overlap_text = ", ".join(
+                    f"{category}#{obj_id}:{ratio:.3f}"
+                    for category, obj_id, ratio, _ in top_overlaps
+                ) or "none"
+                print(
+                    f"[Debug] dropped verified goal candidate: label={label} angle={angle_picture} "
+                    f"box={[int(x1), int(y1), int(x2), int(y2)]} overlaps={overlap_text}"
+                )
+
+            similarities = [
+                (label, obj.angle, obj.obj_id, get_text_similarity(label, obj.category), obj.category, obj.center)
+                for obj in filtered_objects
+            ]
+
+            if similarities:
+                max_similarity = max(similarities, key=lambda x: x[3])[3]
+                max_similar_objs = [
+                    (label, angle, obj_id, simi, category, center)
+                    for label, angle, obj_id, simi, category, center in similarities
+                    if simi == max_similarity
+                ]
+                if len(max_similar_objs) > 1:
+                    closest_obj = min(max_similar_objs, key=lambda x: euclidean(current_position, x[5]))
+                    max_similar_objs = [closest_obj]
+
+                objects = []
+
+                if len(topomap.used_id)!=0 and any(max_similar_objs[0][2] == item[0] for item in topomap.used_id):
+                    item_to_remove = max_similar_objs[0][0]
+                    json_origin = topomap.now.describe[i]
+                    objects_angle = json.loads(json_origin)
+                    objects_origin = objects_angle['Objects']
+                    objects = [obj for obj in objects_origin if canonical_goal_name(obj.lower()) != item_to_remove.lower()]
+                    obj_dict['Angle'] = angle_picture
+                    obj_dict['Objects'] = objects
+                    if len(objects) == 0:
+                        empty_position.append(i)
+                        empty_flag = 1
+                        continue
+                    topomap.now.describe[i] = json.dumps(obj_dict, indent=4)
+                    continue
+                else :
+                    if not object_describe_multi_time:
+                        topomap.used_id.append([max_similar_objs[0][2],max_similar_objs[0][3]])
+                    if use_real_semetic:
+                        json_origin = topomap.now.describe[i]
+                        objects_angle = json.loads(json_origin)
+                        objects_origin = objects_angle['Objects']
+                        for k,obj in enumerate(objects_origin):
+                            for similar_obj in max_similar_objs:
+                                if canonical_goal_name(similar_obj[0].lower()) == canonical_goal_name(obj.lower()):
+                                    objects_angle['Objects'][k] = similar_obj[4]
+                        max_similar_objs_list.append([
+                            (
+                                max_similar_objs[0][4],
+                                max_similar_objs[0][1],
+                                int(max_similar_objs[0][2]),
+                                max_similar_objs[0][3],
+                                max_similar_objs[0][4],
+                                max_similar_objs[0][5]
+                            )
+                        ])
+                        topomap.now.describe[i] = json.dumps(objects_angle, indent=4)
+                    else:
+                        max_similar_objs_list.append(max_similar_objs)
+                    print(max_similar_objs[0][4])
+                    if use_pruning:
+                        for k in range(0,len(final_goal_list)):
+                            if get_text_similarity(final_goal_list[k], max_similar_objs[0][4]) + 0.1 * max(get_text_similarity(final_goal_list[k], 'door'), get_text_similarity(final_goal_list[k], 'door frame')) > topomap.now.similarity[i][k]:
+                                topomap.now.similarity[i][k] = get_text_similarity(final_goal_list[k], max_similar_objs[0][4])
+            if empty_flag == 1:
+                break
+    return max_similar_objs_list,empty_position
+
+
+def split_trajectory_for_h2o(trajectory_text, recent_count=None):
+    if recent_count is None:
+        recent_count = int(os.environ.get("EFFICIENTNAV_H2O_RECENT_TRAJECTORY_COUNT", "5"))
+    entries = [
+        entry.strip()
+        for entry in str(trajectory_text or "").split(".")
+        if entry.strip()
+    ]
+    if not entries:
+        return "", ""
+    recent_count = max(0, int(recent_count))
+    if recent_count == 0:
+        old_entries = entries
+        recent_entries = []
+    else:
+        old_entries = entries[:-recent_count]
+        recent_entries = entries[-recent_count:]
+    old_text = ". ".join(old_entries)
+    recent_text = ". ".join(recent_entries)
+    if old_text:
+        old_text += "."
+    if recent_text:
+        recent_text += "."
+    return old_text, recent_text
+
+
+def planning(place_describe,place_describe_cache,final_goal,trajectory,allowed_objects=None,allowed_objects_by_place=None):
+    planning_start_time = time.perf_counter()
+    effective_use_kv_cache = use_kv_cache and place_describe_cache is not None
+    initial_cache_seq_len = get_kv_cache_seq_len(place_describe_cache)
+    print(
+        f"[Debug] KV cache planning status: requested={use_kv_cache} "
+        f"cache_provided={place_describe_cache is not None} "
+        f"initial_cache_seq={initial_cache_seq_len} "
+        f"will_use={effective_use_kv_cache}"
+    )
+    if effective_use_kv_cache and isinstance(place_describe_cache, tuple):
+        if DynamicCache is None:
+            print("[Debug] DynamicCache unavailable, falling back to non-KV planning")
+            effective_use_kv_cache = False
+        else:
+            try:
+                place_describe_cache = convert_legacy_kv_to_runtime_cache(place_describe_cache)
+                print(
+                    f"[Debug] KV cache converted for decode: "
+                    f"runtime_type={type(place_describe_cache).__name__} "
+                    f"cache_seq={get_kv_cache_seq_len(place_describe_cache)}"
+                )
+            except Exception as exc:
+                print(f"[Debug] KV cache conversion failed, falling back to non-KV planning: {exc}")
+                effective_use_kv_cache = False
+    old_trajectory, recent_trajectory = split_trajectory_for_h2o(trajectory)
+    planner_context_parts = []
+    if use_traj and old_trajectory:
+        planner_context_parts.append(
+            "<|trajectory|>\n"
+            f"Older traveled objects: {old_trajectory}\n"
+            "<|/trajectory|>"
+        )
+    per_place_text = []
+    if allowed_objects_by_place:
+        for place_idx, labels in allowed_objects_by_place.items():
+            if labels:
+                per_place_text.append(f'Place {place_idx}: {", ".join(labels)}')
+        if per_place_text:
+            planner_context_parts.append(
+                "<|planner_context|>\n"
+                "Valid choosable objects by place are: "
+                + " ; ".join(per_place_text)
+                + ". The Objects field must contain exactly one object from the chosen place list.\n"
+                "<|/planner_context|>"
+            )
+    planner_context_text = "\n".join(part for part in planner_context_parts if part)
+    if planner_context_text:
+        planner_context_text += "\n"
+
+    input_text = '<|instruction_core|>\n'
+    input_text += 'The above is a description of different places in different angles in the environment. '
+    input_text += 'Your can get to any place described in the json data. '
+    input_text += f'Your goal is to find the {final_goal}. Based on the above json data, please choose one specific object to travel to as your target. If your goal is already in the description, please choose it as the target.'
+    if allowed_objects:
+        allowed_objects_text = ', '.join(allowed_objects)
+        input_text += f' You must choose an object only from this allowed list: {allowed_objects_text}.'
+        if final_goal in allowed_objects:
+            input_text += f' Since {final_goal} is in the allowed list, choose {final_goal}.'
+        input_text += ' Do not output any object name that is not in the allowed list.'
+    if allowed_objects_by_place:
+        input_text += ' Use the provided valid objects-by-place context and choose exactly one object from the selected place list.'
+    if use_traj:
+        protected_trajectory = recent_trajectory or trajectory
+        input_text += f' Here are the most recent objects that you have traveled to before: {protected_trajectory} Do not choose the objects that you have traveled to before as the target. '
+    if pay_attention_to_door:
+        if use_real_semetic:
+            input_text += ' Note that you can travel to door or door frame to other spaces if there are no clear evidence to choose the target. '
+        else:
+            input_text += ' Note that you can travel to entrance or door frame to other spaces if there are no clear evidence to choose the target. '
+    decision_context_lines = [f"Final goal: {final_goal}."]
+    if per_place_text:
+        decision_context_lines.append(
+            "Valid objects by place: "
+            + " ; ".join(per_place_text)
+            + "."
+        )
+    if allowed_objects:
+        decision_context_lines.append(
+            "Allowed object names: "
+            + ", ".join(allowed_objects)
+            + "."
+        )
+    if use_traj:
+        decision_context_lines.append(
+            "Most recent traveled objects to avoid: "
+            + (recent_trajectory or trajectory or "none")
+        )
+    input_text += (
+        "\n<|decision_context|>\n"
+        + "\n".join(decision_context_lines)
+        + "\n<|/decision_context|>\n"
+    )
+    input_text+=''' Return exactly one JSON object by referring to the following template.
+            {"Place": x, "Angle": x, "Objects": ["xxxx"] }
+            If your goal is already in the description, please choose it as the target. You should not output any explanation, markdown, prose, examples, or extra text before or after the JSON. Note that your should choose only one object in one angle of one place in the json data as the target.
+<|/instruction_core|>'''
+    if not effective_use_kv_cache:
+        prompt2 = build_chat_prompt(f"{place_describe}\n{planner_context_text}{input_text}")
+        inputs2 = planner_text_processor(prompt2, padding=True, return_tensors="pt").to(device0)
+        with torch.no_grad():
+            if internvl_mode:
+                ensure_internvl_context_token_id()
+                output2 = planner_model.generate(
+                    input_ids=inputs2["input_ids"],
+                    attention_mask=inputs2.get("attention_mask"),
+                    max_new_tokens=48,
+                    do_sample=False,
+                    repetition_penalty=1.05,
+                    eos_token_id=list(get_planner_eos_token_ids()),
+                    pad_token_id=planner_tokenizer.pad_token_id,
+                )
+            else:
+                output2 = planner_model.generate(
+                    **inputs2,
+                    max_new_tokens=48,
+                    do_sample=False,
+                    repetition_penalty=1.05,
+                    eos_token_id=planner_tokenizer.eos_token_id,
+                    pad_token_id=planner_tokenizer.pad_token_id,
+                )
+    else:
+        text_model = getattr(planner_model, "language_model", planner_model)
+        protected_prompt_pruning = build_chat_prompt(input_text)
+        prompt_pruning = build_chat_prompt(f"{planner_context_text}{input_text}") if planner_context_text else protected_prompt_pruning
+        new_input_pruning = planner_text_processor(prompt_pruning, padding=True, return_tensors="pt").to(device0)
+        prompt_pruning_token_count = protected_suffix_from_marker(
+            planner_text_processor,
+            new_input_pruning["input_ids"][0],
+            "<|decision_context|>",
+        )
+        if prompt_pruning_token_count is None:
+            prompt_pruning_token_count = protected_suffix_from_marker(
+                planner_text_processor,
+                new_input_pruning["input_ids"][0],
+                "<|instruction_core|>",
+            )
+        if prompt_pruning_token_count is None:
+            protected_input_pruning = planner_text_processor(protected_prompt_pruning, padding=True, return_tensors="pt").to(device0)
+            prompt_pruning_token_count = int(protected_input_pruning["input_ids"].shape[1])
+        print(
+            f"[Debug] KV cache decode input: cache_seq={get_kv_cache_seq_len(place_describe_cache)} "
+            f"suffix_tokens={int(new_input_pruning['input_ids'].shape[1])} "
+            f"protected_suffix={prompt_pruning_token_count}"
+        )
+        generated_tokens = []
+        h2o_decode_step = 0
+        h2o_heavy_scores = None
+        if h2o_enabled():
+            h2o_heavy_scores = merge_heavy_scores(
+                h2o_heavy_scores,
+                build_goal_heavy_scores(planner_text_processor, new_input_pruning["input_ids"][0], final_goal),
+            )
+            h2o_heavy_scores = merge_heavy_scores(
+                h2o_heavy_scores,
+                build_segment_heavy_scores(planner_text_processor, new_input_pruning["input_ids"][0]),
+            )
+            h2o_heavy_scores = merge_heavy_scores(
+                h2o_heavy_scores,
+                build_semantic_heavy_scores(planner_text_processor, new_input_pruning["input_ids"][0], final_goal),
+            )
+        eos_token_ids = get_planner_eos_token_ids()
+        for _ in range(48):
+            with torch.no_grad():
+                outputs = text_model(
+                    input_ids=new_input_pruning['input_ids'],
+                    past_key_values=place_describe_cache,
+                    use_cache=True,
+                    output_attentions=h2o_enabled() and h2o_use_attention_scores(),
+                )
+            next_token = outputs.logits.argmax(dim=-1)[:, -1:]
+            next_token_id = int(next_token[0][0])
+            if next_token_id in eos_token_ids:
+                break
+            generated_tokens.append(next_token_id)
+            place_describe_cache = outputs.past_key_values
+            if h2o_enabled():
+                try:
+                    if h2o_heavy_scores is not None:
+                        h2o_heavy_scores = torch.cat(
+                            [
+                                h2o_heavy_scores.detach().flatten(),
+                                torch.zeros(1, dtype=h2o_heavy_scores.dtype, device=h2o_heavy_scores.device),
+                            ],
+                            dim=0,
+                        )
+                    attention_scores = (
+                        build_attention_heavy_scores(getattr(outputs, "attentions", None))
+                        if h2o_use_attention_scores()
+                        else None
+                    )
+                    h2o_heavy_scores = merge_heavy_scores(h2o_heavy_scores, attention_scores)
+                    legacy_cache = convert_runtime_kv_to_legacy_cache(place_describe_cache)
+                    legacy_cache, h2o_stats = apply_h2o_to_legacy_cache(
+                        legacy_cache,
+                        heavy_scores=h2o_heavy_scores,
+                        protected_suffix=prompt_pruning_token_count + h2o_decode_step,
+                        label="decode",
+                    )
+                    if h2o_stats.get("applied"):
+                        h2o_heavy_scores = trim_heavy_scores(h2o_heavy_scores, h2o_stats.get("keep_indices"))
+                        place_describe_cache = convert_legacy_kv_to_runtime_cache(legacy_cache)
+                        if h2o_decode_step == 0 or h2o_decode_step % 16 == 0:
+                            print(
+                                "[Debug] H2O cache eviction: "
+                                f"label={h2o_stats.get('label')} "
+                                f"seq_before={h2o_stats.get('seq_before')} "
+                                f"seq_after={h2o_stats.get('seq_after')} "
+                                f"kept_recent={h2o_stats.get('kept_recent')} "
+                                f"kept_heavy={h2o_stats.get('kept_heavy')} "
+                                f"protected_prefix={h2o_stats.get('protected_prefix')} "
+                                f"protected_suffix={h2o_stats.get('protected_suffix')} "
+                                f"prefix_outside_budget={h2o_stats.get('protected_prefix_outside_budget')} "
+                                f"budget={h2o_stats.get('budget')}"
+                            )
+                except Exception as exc:
+                    print(f"[Debug] H2O decode eviction skipped: {exc}")
+            h2o_decode_step += 1
+            new_input_pruning = {'input_ids': next_token}
+
+    if not effective_use_kv_cache:
+        generated = output2[:, inputs2["input_ids"].shape[1]:]
+        real_output2 = planner_tokenizer.decode(generated[0], skip_special_tokens=True)
+        del output2
+    else:
+        real_output2 = planner_tokenizer.decode(generated_tokens, skip_special_tokens=True)
+        if last_non_space_char(real_output2) == ']':
+            real_output2 += '}'
+        del generated_tokens
+    torch.cuda.empty_cache()
+    gc.collect()
+    print(input_text)
+    print(real_output2)
+
+    llava_answer2 = real_output2.strip()
+    planning_elapsed = time.perf_counter() - planning_start_time
+    planning_mode = "kv" if effective_use_kv_cache else "no-kv"
+    print(
+        f"[Timing] planning mode={planning_mode} elapsed={planning_elapsed:.3f}s "
+        f"final_cache_seq={get_kv_cache_seq_len(place_describe_cache) if effective_use_kv_cache else None}"
+    )
+
+    return llava_answer2
+
+
+
+
+
+
+def val_one_episode(topomap,sim,agent,start_point,start_rotation,final_goal_id,final_goal,distance):
+    episode_start_time = time.perf_counter()
+    final_goal = canonical_goal_name(final_goal)
+    visible_ratio_threshold = float(os.environ.get("EFFICIENTNAV_VISIBLE_RATIO_THRESHOLD", "0.002"))
+    min_visible_bbox_side_px = int(os.environ.get("EFFICIENTNAV_MIN_VISIBLE_BBOX_SIDE_PX", "24"))
+    goal_success_thresholds = get_goal_success_thresholds(final_goal)
+    goal_success_visible_ratio_threshold = float(goal_success_thresholds["semantic_visible_ratio"])
+    goal_success_min_bbox_side_px = int(goal_success_thresholds["semantic_min_bbox_side"])
+    goal_success_rgb_min_bbox_side_px = int(goal_success_thresholds["rgb_min_bbox_side"])
+    print(
+        f"[Debug] goal success thresholds: goal={final_goal} "
+        f"size_class={goal_success_thresholds['size_class']} "
+        f"semantic_visible_ratio={goal_success_visible_ratio_threshold} "
+        f"semantic_min_bbox_side={goal_success_min_bbox_side_px} "
+        f"rgb_min_bbox_side={goal_success_rgb_min_bbox_side_px}"
+    )
+
+    # ==========================================================================================================================================
+    # INITIAL SIM
+    # =================================================================================================================================================================
+
+    agent_state = ThorAgentState(np.array(start_point, dtype=np.float32), float(start_rotation))
+    agent.set_state(agent_state)
+
+    # =================================================================================================================================================================
+    # FIND SHORTEST PATH
+    # ==========================================================================================================================================
+
+    scene = sim.semantic_scene
+    final_goal_label_ids = set()
+    for semantic_idx, scene_object in enumerate(scene.objects):
+        if semantic_idx == 0:
+            continue
+        if canonical_goal_name(scene_object.category.name()) == final_goal:
+            final_goal_label_ids.add(semantic_idx)
+
+    def get_object_position(object_id):
+        obj = scene.objects[object_id]
+        return obj.category.name(),obj.obb.center, obj.obb.sizes
+
+
+    _,shortest_target_position, shortest_target_dims = get_object_position(final_goal_id)
+
+    path = ThorShortestPath()
+    path.requested_start = agent.state.position
+    path.requested_end = shortest_target_position
+
+    initial_pathfinder_start_time = time.perf_counter()
+    found_path = sim.pathfinder.find_path(path)
+    initial_pathfinder_elapsed = time.perf_counter() - initial_pathfinder_start_time
+    print(
+        f"[Timing] pathfinder goal-distance elapsed={initial_pathfinder_elapsed:.3f}s "
+        f"found={found_path}"
+    )
+    path_points = path.points
+
+    shortest_length = 0
+    if found_path:
+        for i, point in enumerate(path_points):
+            if i==0 :
+                continue
+            else :
+                shortest_length += math.sqrt((path_points[i][0]-path_points[i-1][0])**2+(path_points[i][2]-path_points[i-1][2])**2)
+    real_distance = shortest_length
+    print(f'real_distance:{real_distance}')
+
+
+    # ==========================================================================================================================================
+    # INITIAL PARAMETERS
+    # ==========================================================================================================================================
+
+
+    if not use_door_as_trajectory:
+        trajectory = ' '
+    else:
+        trajectory = 'Door. Window.'
+
+    sub_goal_history = []
+    final_length = 0
+    trajectory_length = 0.0
+
+
+    last_target_position = agent_state.position
+    ## do not navigate to the same nodes
+    last_key = []
+    last_angle = []
+    last_index = []
+    target_tuple = None
+    last_answer = ' '
+    repeated_answer_count = 0
+    episode_success = False
+    visible_goal_target_position = None
+    visible_goal_name = None
+    place_target_visit_counts = {}
+    visited_transition_target_ids = set()
+    used_target_keys = set()
+    used_target_object_ids = set()
+    candidate_source_places = {}
+
+    def get_current_described_labels_for_place(place_idx, selected_only=True):
+        node = topomap.find_node(topomap.root, f'Place {place_idx}')
+        if node is None:
+            return set()
+        current_labels = set()
+        selected_indices = None
+        if selected_only and hasattr(topomap, "_get_selected_description_indices"):
+            try:
+                selected_indices = topomap._get_selected_description_indices(
+                    node,
+                    last_key,
+                    last_index,
+                    final_goal,
+                )
+            except Exception:
+                selected_indices = None
+        if selected_indices is None:
+            describe_entries = node.describe
+        else:
+            describe_entries = [
+                node.describe[i]
+                for i in selected_indices
+                if 0 <= i < len(node.describe)
+            ]
+        for describe_json in describe_entries:
+            try:
+                describe_data = json.loads(describe_json)
+            except Exception:
+                continue
+            for obj in describe_data.get("Objects", []):
+                normalized = canonical_goal_name(str(obj).strip().lower())
+                if normalized:
+                    current_labels.add(normalized)
+        return current_labels
+
+    def get_current_described_objects_for_place(place_idx, selected_only=True):
+        node = topomap.find_node(topomap.root, f'Place {place_idx}')
+        if node is None:
+            return set()
+        selected_indices = None
+        if selected_only and hasattr(topomap, "_get_selected_description_indices"):
+            try:
+                selected_indices = topomap._get_selected_description_indices(
+                    node,
+                    last_key,
+                    last_index,
+                    final_goal,
+                )
+            except Exception:
+                selected_indices = None
+        if selected_indices is None:
+            describe_entries = list(enumerate(node.describe))
+        else:
+            describe_entries = [
+                (i, node.describe[i])
+                for i in selected_indices
+                if 0 <= i < len(node.describe)
+            ]
+        current_objects = set()
+        for _, describe_json in describe_entries:
+            try:
+                describe_data = json.loads(describe_json)
+            except Exception:
+                continue
+            angle_value = int(describe_data.get("Angle", 0))
+            for obj in describe_data.get("Objects", []):
+                normalized = canonical_goal_name(str(obj).strip().lower())
+                if normalized:
+                    current_objects.add((angle_value, normalized))
+        return current_objects
+
+    def get_described_angles_for_label(place_idx, label, selected_only=True):
+        return [
+            angle
+            for angle, observed_label in get_current_described_objects_for_place(place_idx, selected_only)
+            if planner_label_match(observed_label, label)
+        ]
+
+    def is_described_label_match(place_idx, label, selected_only=True):
+        return any(
+            planner_label_match(observed_label, label)
+            for observed_label in get_current_described_labels_for_place(place_idx, selected_only)
+        )
+
+    def synthesize_semantic_candidates_for_place(
+        place_idx,
+        current_objects,
+        selected_target_ids,
+        only_labels=None,
+        allow_final_goal=False,
+    ):
+        node = topomap.find_node(topomap.root, f'Place {place_idx}')
+        if node is None:
+            return []
+        only_labels = {
+            canonical_goal_name(label)
+            for label in only_labels
+        } if only_labels is not None else None
+        observed_by_label = {}
+        for angle, observed_label in current_objects:
+            normalized_observed = canonical_goal_name(observed_label)
+            if only_labels is not None and normalized_observed not in only_labels:
+                continue
+            if normalized_observed == final_goal and not allow_final_goal:
+                continue
+            if is_low_value_planner_label(normalized_observed, final_goal):
+                continue
+            if not (
+                normalized_observed == final_goal
+                or normalized_observed in transition_planner_labels
+                or normalized_observed in semantic_anchor_labels
+            ):
+                continue
+            observed_by_label.setdefault(normalized_observed, []).append(int(angle))
+
+        synthesized = []
+        for observed_label, observed_angles in observed_by_label.items():
+            scene_matches = []
+            for object_id, scene_object in enumerate(scene.objects):
+                if object_id == 0 or object_id in selected_target_ids:
+                    continue
+                if object_id in used_target_object_ids:
+                    continue
+                scene_label = canonical_goal_name(scene_object.category.name())
+                if not planner_label_match(observed_label, scene_label):
+                    continue
+                candidate_key = (scene_label, int(observed_angles[0]), int(object_id))
+                if candidate_key in used_target_keys:
+                    continue
+                if not is_revisitable_transition_candidate(scene_label, object_id):
+                    continue
+                object_position = np.array(scene_object.obb.center, dtype=np.float32)
+                distance_to_place = euclidean(np.array(node.position)[[0, 2]], object_position[[0, 2]])
+                scene_matches.append((distance_to_place, scene_label, object_id, object_position))
+            if not scene_matches:
+                continue
+            scene_matches.sort(key=lambda item: item[0])
+            _, scene_label, object_id, object_position = scene_matches[0]
+            synthesized.append(
+                (
+                    scene_label,
+                    int(observed_angles[0]),
+                    int(object_id),
+                    0.5,
+                    scene_label,
+                    object_position,
+                )
+            )
+            selected_target_ids.add(int(object_id))
+        return synthesized
+
+    def get_place_group(place_idx):
+        node = topomap.find_node(topomap.root, f'Place {place_idx}')
+        if node is None or node.group is None:
+            return int(place_idx)
+        return int(node.group)
+
+    def build_group_members():
+        group_to_rep = {}
+        rep_to_members = {}
+        for place_idx in range(len(topomap.place_clip_id)):
+            group_id = get_place_group(place_idx)
+            representative = group_to_rep.get(group_id)
+            if representative is None:
+                representative = int(place_idx)
+                group_to_rep[group_id] = representative
+            rep_to_members.setdefault(representative, []).append(int(place_idx))
+        return rep_to_members
+
+    def order_labels_by_goal_relevance(labels):
+        return sorted(
+            labels,
+            key=lambda label: (
+                canonical_goal_name(label) == final_goal,
+                canonical_goal_name(label) in transition_planner_labels,
+                canonical_goal_name(label) == "window",
+                get_planner_label_priority(label, final_goal),
+                label,
+            ),
+            reverse=True,
+        )
+
+    def get_transition_labels(labels):
+        return [label for label in labels if canonical_goal_name(label) in transition_planner_labels]
+
+    def is_revisitable_transition_candidate(label, obj_id):
+        normalized_label = canonical_goal_name(label)
+        if normalized_label not in transition_planner_labels:
+            return True
+        return int(obj_id) not in visited_transition_target_ids
+
+    def is_revisitable_target(candidate):
+        label = canonical_goal_name(candidate[0])
+        if int(candidate[2]) in used_target_object_ids:
+            return False
+        target_key = (label, int(candidate[1]), int(candidate[2]))
+        if target_key in used_target_keys:
+            return False
+        return is_revisitable_transition_candidate(label, candidate[2])
+
+    def is_synthesized_candidate(candidate):
+        try:
+            return float(candidate[3]) <= 0.500001
+        except Exception:
+            return False
+
+    def target_rank_tuple(target, place_idx=None):
+        label = canonical_goal_name(target[0])
+        try:
+            confidence = float(target[3])
+        except Exception:
+            confidence = 0.0
+        synthesized = is_synthesized_candidate(target)
+        exact_angles = []
+        if place_idx is not None:
+            exact_angles = get_described_angles_for_label(place_idx, label)
+        exact_visible = place_idx is not None and int(target[1]) in exact_angles
+        transition = label in transition_planner_labels
+        return (
+            label == final_goal,
+            exact_visible,
+            not synthesized,
+            transition,
+            label == "window",
+            confidence,
+            get_planner_label_priority(label, final_goal),
+            -int(target[1]),
+        )
+
+    def collect_allowed_targets_by_place():
+        candidate_source_places.clear()
+        raw_allowed_targets = {}
+        for place_idx, place_candidates in enumerate(topomap.place_clip_id):
+            current_objects = get_current_described_objects_for_place(place_idx)
+            all_current_objects = get_current_described_objects_for_place(place_idx, selected_only=False)
+            selected_target_ids = set()
+            selected_targets = []
+            for object_tuple in place_candidates:
+                if len(object_tuple) == 0:
+                    continue
+                candidate = object_tuple[0]
+                label = canonical_goal_name(str(candidate[0]).strip().lower())
+                angle = int(candidate[1])
+                exact_visible_match = any(
+                    angle == observed_angle and planner_label_match(observed_label, label)
+                    for observed_angle, observed_label in current_objects
+                )
+                selected_label_match = is_described_label_match(place_idx, label)
+                all_label_match = is_described_label_match(place_idx, label, selected_only=False)
+                verified_goal_candidate = label == final_goal
+                if not (
+                    exact_visible_match
+                    or selected_label_match
+                    or all_label_match
+                    or verified_goal_candidate
+                ):
+                    continue
+                if not is_semantically_reasonable_planner_label(label, final_goal):
+                    continue
+                if not is_revisitable_target(candidate):
+                    continue
+                selected_targets.append(candidate)
+                selected_target_ids.add(int(candidate[2]))
+            if not selected_targets:
+                selected_targets.extend(
+                    synthesize_semantic_candidates_for_place(
+                        place_idx,
+                        all_current_objects,
+                        selected_target_ids,
+                    )
+                )
+            if selected_targets:
+                exact_count = 0
+                relaxed_count = 0
+                for target in selected_targets:
+                    target_label = canonical_goal_name(target[0])
+                    target_angle = int(target[1])
+                    if any(
+                        target_angle == observed_angle and planner_label_match(observed_label, target_label)
+                        for observed_angle, observed_label in current_objects
+                    ):
+                        exact_count += 1
+                    else:
+                        relaxed_count += 1
+                if relaxed_count > 0:
+                    print(
+                        f"[Debug] resolver candidates place={place_idx}: "
+                        f"exact={exact_count} relaxed_or_synthesized={relaxed_count}"
+                    )
+            filtered_targets = [
+                target for target in selected_targets
+                if not is_low_value_planner_label(target[0], final_goal)
+            ]
+            filtered_targets.sort(
+                key=lambda target: target_rank_tuple(target, place_idx),
+                reverse=True,
+            )
+            raw_allowed_targets[place_idx] = filtered_targets
+
+        grouped_allowed_targets = {}
+        group_members = build_group_members()
+        for representative, member_places in group_members.items():
+            grouped_candidates = []
+            seen_target_keys = set()
+            seen_target_object_ids = set()
+            for member_place in member_places:
+                for candidate in raw_allowed_targets.get(member_place, []):
+                    target_key = (
+                        canonical_goal_name(candidate[0]),
+                        int(candidate[1]),
+                        int(candidate[2]),
+                    )
+                    object_id = int(candidate[2])
+                    if target_key in seen_target_keys or object_id in seen_target_object_ids:
+                        continue
+                    seen_target_keys.add(target_key)
+                    seen_target_object_ids.add(object_id)
+                    grouped_candidates.append(candidate)
+                    candidate_source_places[target_key] = int(member_place)
+            grouped_candidates.sort(
+                key=lambda target: target_rank_tuple(target, candidate_source_places.get((
+                    canonical_goal_name(target[0]),
+                    int(target[1]),
+                    int(target[2]),
+                ), representative)),
+                reverse=True,
+            )
+            grouped_allowed_targets[int(representative)] = grouped_candidates
+        return grouped_allowed_targets
+
+    def collect_allowed_objects_by_place(allowed_targets_by_place=None):
+        if allowed_targets_by_place is None:
+            allowed_targets_by_place = collect_allowed_targets_by_place()
+        base_allowed_by_place = {}
+        for place_idx, targets in allowed_targets_by_place.items():
+            ordered_labels = []
+            seen = set()
+            for target in targets:
+                label = canonical_goal_name(target[0])
+                if label in seen:
+                    continue
+                ordered_labels.append(label)
+                seen.add(label)
+            base_allowed_by_place[place_idx] = ordered_labels
+
+        unseen_places = {
+            place_idx
+            for place_idx, labels in base_allowed_by_place.items()
+            if labels and place_target_visit_counts.get(place_idx, 0) == 0
+        }
+
+        if unseen_places:
+            allowed_by_place = {}
+            for place_idx, labels in base_allowed_by_place.items():
+                if place_idx in unseen_places:
+                    allowed_by_place[place_idx] = labels
+                else:
+                    allowed_by_place[place_idx] = []
+            return allowed_by_place
+
+        allowed_by_place = {}
+        for place_idx, labels in base_allowed_by_place.items():
+            allowed_by_place[place_idx] = labels
+        return allowed_by_place
+
+    def collect_allowed_objects():
+        allowed_by_place = collect_allowed_objects_by_place()
+        scored_labels = {}
+        for labels in allowed_by_place.values():
+            for label in labels:
+                score = get_planner_label_priority(label, final_goal)
+                existing_score = scored_labels.get(label)
+                if existing_score is None or score > existing_score:
+                    scored_labels[label] = score
+        return order_labels_by_goal_relevance(list(scored_labels.keys()))
+
+    def find_direct_goal_choice():
+        for place_idx, targets in allowed_targets_by_place.items():
+            for candidate in targets:
+                candidate_label = canonical_goal_name(candidate[0])
+                if candidate_label == final_goal:
+                    return {
+                        "Place": place_idx,
+                        "Angle": int(candidate[1]),
+                        "Objects": [final_goal],
+                    }
+        return None
+
+    def choose_frontier_fallback(allowed_objects_by_place):
+        visited_labels = {label.strip().lower() for label in sub_goal_history}
+        frontier_priority = ["doorway", "door frame", "door", "window"]
+        for frontier_label in frontier_priority:
+            for place_idx in sorted(allowed_objects_by_place.keys()):
+                labels = allowed_objects_by_place.get(place_idx, [])
+                if frontier_label in labels and frontier_label not in visited_labels:
+                    return {"Place": place_idx, "Angle": 0, "Objects": [frontier_label]}
+        for place_idx in sorted(allowed_objects_by_place.keys()):
+            for label in allowed_objects_by_place.get(place_idx, []):
+                if label not in visited_labels:
+                    return {"Place": place_idx, "Angle": 0, "Objects": [label]}
+        return None
+
+    def choose_raw_frontier_fallback():
+        raw_targets_by_place = collect_allowed_targets_by_place()
+        frontier_priority = ["doorway", "door frame", "door", "window"]
+        for frontier_label in frontier_priority:
+            for place_idx, targets in raw_targets_by_place.items():
+                for candidate in targets:
+                    if canonical_goal_name(candidate[0]) == frontier_label:
+                        return {
+                            "Place": int(place_idx),
+                            "Angle": int(candidate[1]),
+                            "Objects": [frontier_label],
+                        }
+        return None
+
+    for epoch in range(0,30):
+        length_this_epoch = 0.0
+        sr = 0
+        spl = 0.0
+        target_index = final_goal_list.index(final_goal)
+        place_describe_cache = None
+
+        # ==========================================================================================================================================
+        # GET OBSERVATION
+        # ==========================================================================================================================================
+        if topomap.current_inference > 0:
+            nearest_length, nearest_position,nearest_node  = topomap.find_nearest_node(topomap.root,agent_state.position)
+        else:
+            nearest_length = 1000
+        if group_node :
+            skip_node = (nearest_length < hebing_threshould) and (topomap.current_inference > 0)
+        else:
+            skip_node = nearest_length < hebing_threshould+1 and topomap.current_inference > 0 and epoch ==0
+        fig_name = f'big+{topomap.num_node}+{epoch}'
+        if skip_node:
+            topomap.now = nearest_node
+        else:
+            surroundings = []
+            depth = []
+            semantic_observations = []
+            images = []
+            images_per_row = 2
+            fig, axes = plt.subplots(ceil(360 / 90 / images_per_row), images_per_row, figsize=(15, 15))
+
+            for idx, angle in enumerate(range(0, 360, 90)):
+                agent_state.rotation = float(angle)
+                agent.set_state(agent_state)
+                if observation_rotation_pause > 0:
+                    print(
+                        f"[Debug] observation rotation: angle={angle} pause={observation_rotation_pause:.2f}s"
+                    )
+                    time.sleep(observation_rotation_pause)
+                sur = sim.get_sensor_observations()
+                surroundings.append(sur)
+                semantic_observations.append(sur["semantic_sensor"])
+                color_image = sur["color_sensor"]
+                depth.append(sur["depth_sensor"])
+                image_path = f"navigation_images/{fig_name}+surroundings_angle_{angle}.png"
+                imageio.imwrite(image_path, color_image)
+                row, col = divmod(idx, images_per_row)
+
+            image1 = I.open(f"navigation_images/{fig_name}+surroundings_angle_0.png").convert("RGB")
+            image2 = I.open(f"navigation_images/{fig_name}+surroundings_angle_90.png").convert("RGB")
+            image3 = I.open(f"navigation_images/{fig_name}+surroundings_angle_180.png").convert("RGB")
+            image4 = I.open(f"navigation_images/{fig_name}+surroundings_angle_270.png").convert("RGB")
+
+
+            image_size=672
+            image1 = image1.resize((image_size,image_size), I.LANCZOS)
+            image2 = image2.resize((image_size,image_size), I.LANCZOS)
+            image3 = image3.resize((image_size,image_size), I.LANCZOS)
+            image4 = image4.resize((image_size,image_size), I.LANCZOS)
+            images = [image1,image2,image3,image4]
+
+            ##put the images into LLava for first stage, and put the output to llava for second stage, xxx is the output
+            # ==========================================================================================================================================
+            # DESCRIBE IMAGE
+            # ==========================================================================================================================================
+
+
+            llava_answer1,position_looked = get_observation(images,depth)
+            json_objects = copy.deepcopy(llava_answer1)
+            obj_dict = {"Angle": 0, "Objects": []}
+
+            llava_answer1 = []
+
+            for json_obj in json_objects:
+                obj_dict = json.loads(json_obj)
+                obj_dict['Objects'] = list(set(obj_dict['Objects']))
+                llava_answer1.append(json.dumps(obj_dict, indent=4))
+
+            if use_kv_cache:
+                empty_position = []
+                for i in range(0, len(llava_answer1)):
+                    objects_angle = json.loads(llava_answer1[i])
+                    obj_dict = {'Place': topomap.num_node, **{key: value for key, value in objects_angle.items()}}
+                    if len(obj_dict['Objects'])==0:
+                        empty_position.append(i)
+                    llava_answer1[i] = json.dumps(obj_dict, indent=4)
+
+                empty_position.sort(reverse=True)
+                for i in range(len(empty_position)):
+                    del llava_answer1[empty_position[i]]
+                    if empty_position[i] < len(position_looked):
+                        del position_looked[empty_position[i]]
+
+            if topomap.current_inference==0:
+                topomap.add_node(parent_key=None, key = 'Place 0', position = copy.deepcopy(agent_state.position), distance_to_parent = 0.0, picture = images, describe = llava_answer1,direction=None,waypoint=None)
+                topomap.num_node += 1
+                topomap.current_inference += 1
+            else:
+                # topomap.add_node(parent_key=None, key = f'Place {topomap.num_node}', position = target_position, distance_to_parent = 0.0, picture = [image1,image2,image3,image4], describe = llava_answer1,direction=None,waypoint=None)
+                topomap.add_node(parent_key=None, key = f'Place {topomap.num_node}', position = copy.deepcopy(agent_state.position), distance_to_parent = 0.0, picture = images, describe = llava_answer1,direction=None,waypoint=None)
+                topomap.num_node += 1
+                topomap.current_inference += 1
+
+            torch.cuda.empty_cache()
+            gc.collect()
+
+            # ==========================================================================================================================================
+            # GET_OBJECTS_BOXES
+            # ==========================================================================================================================================
+
+            box_info_list_sum = get_objects_boxes(llava_answer1,fig_name,final_goal)
+            print(f"[Debug] box_info_list_sum: {box_info_list_sum}")
+
+            # ==========================================================================================================================================
+            # GET_OBJECTS
+            # ==========================================================================================================================================
+            max_similar_objs_list,empty_position = get_objects(
+                topomap,
+                scene,
+                position_looked,
+                box_info_list_sum,
+                semantic_observations,
+                copy.deepcopy(obj_dict),
+                final_goal,
+            )
+            print(f"[Debug] max_similar_objs_list: {max_similar_objs_list}")
+            print(f"[Debug] empty_position: {empty_position}")
+
+            topomap.place_clip_id.append(max_similar_objs_list)
+
+            # ==========================================================================================================================================
+            # LLM决定子目标
+            # ==========================================================================================================================================
+            llava_answer_concat = ' '
+
+            for i in range(0, len(topomap.now.describe)):
+                llava_answer_concat += topomap.now.describe[i]
+
+
+
+        if use_pruning:
+            similarity = topomap.get_similarity_threshould(topomap.root,last_key,last_index,target_index,final_goal)
+            similarity.sort(reverse=True)
+            if len(similarity) <= node_pruning_num:
+                topomap.similarity_threshould[target_index] = similarity[-1]
+            else:
+                topomap.similarity_threshould[target_index] = similarity[node_pruning_num]
+        if use_kv_cache and topomap.use_kv_cache and topomap.kv_cache_supported:
+            topomap.used_groups = []
+            place_describe,place_describe_cache= topomap.create_describe_and_cache(planner_model,topomap.root,last_key,last_index,target_index,final_goal)
+        else:
+            place_describe_cache = None
+            place_describe= topomap.create_describe(topomap.root,last_key,last_index,target_index,final_goal)
+        print(place_describe)
+
+        allowed_targets_by_place = collect_allowed_targets_by_place()
+        allowed_objects_by_place = collect_allowed_objects_by_place(allowed_targets_by_place)
+        allowed_objects = order_labels_by_goal_relevance(
+            list(
+                {
+                    label
+                    for labels in allowed_objects_by_place.values()
+                    for label in labels
+                }
+            )
+        )
+        print(f"[Debug] allowed planner objects: {allowed_objects}")
+        print(f"[Debug] allowed planner objects by place: {allowed_objects_by_place}")
+        preselected_planner_choice = None
+        direct_goal_choice = find_direct_goal_choice()
+        if only_llm_baseline:
+            print("[Debug] only-LLM baseline enabled: planner constraints, bypasses, and fallbacks are disabled")
+            llava_answer2 = planning(
+                place_describe,
+                place_describe_cache,
+                final_goal,
+                trajectory,
+                [],
+                {},
+            )
+        elif direct_goal_choice is not None:
+            preselected_planner_choice = direct_goal_choice
+            llava_answer2 = json.dumps(direct_goal_choice, ensure_ascii=False)
+            print(f"[Debug] bypassing planner because goal is already observed: {llava_answer2}")
+        elif single_object_bypass and len(allowed_objects) == 1:
+            single_label = canonical_goal_name(allowed_objects[0])
+            for place_idx, targets in allowed_targets_by_place.items():
+                for candidate in targets:
+                    if canonical_goal_name(candidate[0]) == single_label:
+                        preselected_planner_choice = {
+                            "Place": int(place_idx),
+                            "Angle": int(candidate[1]),
+                            "Objects": [single_label],
+                        }
+                        break
+                if preselected_planner_choice is not None:
+                    break
+            if preselected_planner_choice is None:
+                preselected_planner_choice = choose_frontier_fallback(allowed_objects_by_place)
+            if preselected_planner_choice is None:
+                break
+            llava_answer2 = json.dumps(preselected_planner_choice, ensure_ascii=False)
+            print(f"[Debug] bypassing planner because only one target is allowed: {llava_answer2}")
+        elif len(allowed_objects) == 0:
+            preselected_planner_choice = choose_frontier_fallback(allowed_objects_by_place)
+            if preselected_planner_choice is None:
+                preselected_planner_choice = choose_raw_frontier_fallback()
+            if preselected_planner_choice is None:
+                print("[Debug] no allowed planner objects and no deterministic fallback; stopping episode")
+                break
+            llava_answer2 = json.dumps(preselected_planner_choice, ensure_ascii=False)
+            print(f"[Debug] bypassing planner because allowed target list is empty: {llava_answer2}")
+        else:
+            llava_answer2 = planning(
+                place_describe,
+                place_describe_cache,
+                final_goal,
+                trajectory,
+                allowed_objects,
+                allowed_objects_by_place,
+            )
+
+        # ===================================================================================================================
+        # GET SUB-GOAL
+        # ===================================================================================================================
+
+        if preselected_planner_choice is not None:
+            planner_choice = preselected_planner_choice
+        elif only_llm_baseline:
+            planner_choice = resolve_minimal_llm_choice(
+                parse_planner_response_minimal(llava_answer2),
+                allowed_targets_by_place,
+            )
+        else:
+            planner_choice = parse_planner_response(llava_answer2, allowed_objects_by_place, final_goal)
+        if planner_choice is None:
+            print(f"[Debug] failed to recover planner response from raw text: {llava_answer2!r}")
+            if only_llm_baseline:
+                print("[Debug] only-LLM baseline treating invalid planner response as episode failure")
+                break
+            planner_choice = choose_frontier_fallback(allowed_objects_by_place)
+            if planner_choice is None:
+                break
+            print(f"[Debug] using deterministic fallback planner choice: {planner_choice}")
+        json_str = json.dumps(planner_choice, ensure_ascii=False)
+        print(json_str)
+        if json_str == last_answer:
+            repeated_answer_count += 1
+        else:
+            repeated_answer_count = 0
+        last_answer = json_str
+        if repeated_answer_count >= 3:
+            print("Planner repeated the same target selection. Stopping this episode to avoid looping.")
+            break
+        try:
+            data = planner_choice
+            int(data["Place"])
+        except:
+            break
+
+        target_place = data["Place"]
+        angle_goal = data["Angle"]
+        objects = data["Objects"]
+        if not isinstance(objects, list):
+            objects = [str(objects)]
+        objects = [obj for obj in objects if isinstance(obj, str) and obj.strip()]
+        if len(objects) == 0:
+            break
+        if len(objects) > 1:
+            objects = [objects[0]]
+        objects = [objects[0].strip().lower()]
+        if int(target_place) >= len(topomap.place_clip_id):
+            if only_llm_baseline:
+                print(f"[Debug] only-LLM baseline invalid place {target_place}; stopping episode")
+                break
+            target_place = 0
+        current_place_allowed = allowed_objects_by_place.get(int(target_place), [])
+        requested_object = canonical_goal_name(objects[0])
+        has_matching_target_candidate = any(
+            canonical_goal_name(candidate[0]) == requested_object
+            for candidate in allowed_targets_by_place.get(int(target_place), [])
+        )
+        if only_llm_baseline and not has_matching_target_candidate:
+            print(
+                f"[Debug] only-LLM baseline invalid target: place={target_place} "
+                f"object={objects[0]!r} has no resolved navigation candidate"
+            )
+            break
+        if objects[0] not in current_place_allowed and not has_matching_target_candidate:
+            remapped = False
+            if final_goal in allowed_objects:
+                for place_idx, labels in allowed_objects_by_place.items():
+                    if final_goal in labels:
+                        print(f"[Debug] planner object {objects[0]!r} not allowed for place {target_place}; remapping to goal {final_goal!r} in place {place_idx}")
+                        target_place = place_idx
+                        objects = [final_goal]
+                        remapped = True
+                        break
+            if not remapped and current_place_allowed:
+                print(f"[Debug] planner object {objects[0]!r} not allowed for place {target_place}; remapping to first allowed object {current_place_allowed[0]!r}")
+                objects = [current_place_allowed[0]]
+                remapped = True
+            if not remapped:
+                for place_idx, labels in allowed_objects_by_place.items():
+                    if labels:
+                        print(f"[Debug] planner place {target_place} has no allowed object match; remapping to place {place_idx} object {labels[0]!r}")
+                        target_place = place_idx
+                        objects = [labels[0]]
+                        remapped = True
+                        break
+        print(f"[Debug] planner selected: place={target_place}, angle={angle_goal}, objects={objects}")
+
+        last_angle = angle_goal
+        target_node = topomap.find_node(topomap.root,f'Place {target_place}')
+        print(f'last_key:{last_key}')
+        objects_str = ', '.join(objects)
+        sub_goal_history.append(objects_str)
+
+        if (objects[0].lower() not in trajectory) and (objects[0] not in trajectory):
+            trajectory += f'{objects[0]} in Place {target_place}.'
+
+        # ==========================================================================================================================================
+        # GET SUB-GOAL INFORMATION
+        # ==========================================================================================================================================
+        target_place = int(target_place)
+        if len(topomap.place_clip_id) == 0:
+            break
+        place_targets = allowed_targets_by_place.get(target_place, [])
+        print(f"[Debug] allowed_targets_by_place[{target_place}] candidates: {place_targets}")
+        target_tuple = None
+        requested_object = canonical_goal_name(objects[0]) if objects else ""
+
+        for candidate in place_targets:
+            candidate_label = canonical_goal_name(candidate[0])
+            if candidate_label == requested_object and angle_goal == int(candidate[1]):
+                target_tuple = candidate
+                break
+        if target_tuple is None:
+            for candidate in place_targets:
+                candidate_label = canonical_goal_name(candidate[0])
+                if candidate_label == requested_object:
+                    target_tuple = candidate
+                    break
+        if target_tuple is None and place_targets:
+            if only_llm_baseline:
+                print(
+                    f"[Debug] only-LLM baseline no exact target match for {objects[0]!r}; "
+                    "stopping episode"
+                )
+                break
+            print(
+                f"[Debug] no exact candidate match for {objects[0]!r} in representative place {target_place}; "
+                f"falling back to first grouped candidate"
+            )
+            target_tuple = place_targets[0]
+        if target_tuple is None:
+            print(f"[Debug] failed to resolve target tuple for planner object {objects[0]!r}")
+            if only_llm_baseline:
+                break
+            fallback_choice = choose_frontier_fallback(allowed_objects_by_place)
+            if fallback_choice is None:
+                break
+            fallback_place = int(fallback_choice["Place"])
+            fallback_targets = allowed_targets_by_place.get(fallback_place, [])
+            for candidate in fallback_targets:
+                if canonical_goal_name(candidate[0]) == canonical_goal_name(fallback_choice["Objects"][0]):
+                    target_tuple = candidate
+                    target_place = fallback_place
+                    angle_goal = int(candidate[1])
+                    objects = [candidate[0]]
+                    print(
+                        f"[Debug] using frontier fallback target={candidate[0]!r} "
+                        f"representative_place={target_place}"
+                    )
+                    break
+        if target_tuple is None:
+            print(f"[Debug] failed to resolve target tuple for planner object {objects[0]!r}")
+            break
+        target_key = (
+            canonical_goal_name(target_tuple[0]),
+            int(target_tuple[1]),
+            int(target_tuple[2]),
+        )
+        resolved_source_place = candidate_source_places.get(target_key, target_place)
+        place_target_visit_counts[target_place] = place_target_visit_counts.get(target_place, 0) + 1
+        used_target_keys.add(target_key)
+        used_target_object_ids.add(int(target_tuple[2]))
+        if canonical_goal_name(target_tuple[0]) in transition_planner_labels:
+            visited_transition_target_ids.add(int(target_tuple[2]))
+        print(f"[Debug] resolved target tuple: {target_tuple} from representative place {target_place}")
+        print(
+            f"[Debug] resolved source place: {resolved_source_place} "
+            f"for representative place {target_place}"
+        )
+        print(target_place)
+
+        agent_state = agent.get_state()
+        topomap.now = topomap.find_node(topomap.root, f'Place {resolved_source_place}')
+
+        if topomap.now is None:
+            print(f"[Debug] failed to locate source place node Place {resolved_source_place}")
+            break
+
+        if 'Place'+f' {resolved_source_place}' != topomap.now.key:
+            path = ThorShortestPath()
+            path.requested_start = agent.state.position
+            path.requested_end = topomap.now.position
+
+            pathfinder_start_time = time.perf_counter()
+            found_path = sim.pathfinder.find_path(path)
+            pathfinder_elapsed = time.perf_counter() - pathfinder_start_time
+            print(
+                f"[Timing] pathfinder to-place elapsed={pathfinder_elapsed:.3f}s "
+                f"found={found_path}"
+            )
+            path_points = path.points
+
+            if found_path:
+                for i, point in enumerate(path_points):
+                    if i==0 :
+                        continue
+                    else :
+                        final_length += math.sqrt((path_points[i][0]-path_points[i-1][0])**2+(path_points[i][2]-path_points[i-1][2])**2)
+                        length_this_epoch += math.sqrt((path_points[i][0]-path_points[i-1][0])**2+(path_points[i][2]-path_points[i-1][2])**2)
+
+        observations = []
+        semantic_observations = []
+        # Keep the map cursor on the place that observed the selected target,
+        # but do not move the agent back there. Movement to the sub-goal should
+        # start from the agent's actual current pose.
+        agent_state.position = copy.deepcopy(agent.get_state().position)
+        agent_state.rotation = float(angle_goal)
+        agent.set_state(agent_state)
+        obs = sim.get_sensor_observations()
+        observations.append(obs)
+        semantic_observations.append(obs["semantic_sensor"])
+        color_image = obs["color_sensor"]
+
+        scene = sim.semantic_scene
+
+        # ==========================================================================================================================================
+        # FIND PATH
+        # ==========================================================================================================================================
+
+        last_angle = target_tuple[1]
+        target_node = topomap.find_node(topomap.root,f'Place {resolved_source_place}')
+        if delete_traj:
+            for i in range(0,len(target_node.describe)):
+                last_data = json.loads(target_node.describe[i])
+                if last_angle == last_data["Angle"]:
+                    last_key.append(f'Place {resolved_source_place}')
+                    last_index.append(i)
+                    target_node.state = 'recompute'
+                    break
+
+        print(f'final_goal:{final_goal},sub_goal:{target_tuple[0]},place:{target_place},trajectory:{trajectory}',)
+        sub_target_id = target_tuple[2]
+
+        def is_door(object_id):
+            obj = scene.objects[object_id]
+            return obj.category.name() == "door" or obj.category.name() == "door frame"
+
+        if directly_find and epoch == 29:
+            for i,place_id_tmp in enumerate(topomap.place_clip_id):
+                for j,object_tmp in enumerate(place_id_tmp):
+                    if object_tmp[0][0].lower() in final_goal.lower() or final_goal.lower() in object_tmp[0][0].lower() or (final_goal == 'sofa' and 'couch' in object_tmp[0][0].lower()) or (final_goal == 'tv' and 'television' in object_tmp[0][0].lower()):
+                            sub_target_id = object_tmp[0][2]
+
+        def detect_distance_ahead(agent_position, direction, step_size=0.25, max_distance=5.0):
+            distance_traveled = 0.0
+            current_position = np.array(agent_position)
+            while distance_traveled < max_distance:
+                next_position = current_position + direction * step_size
+                if not sim.pathfinder.is_navigable(next_position):
+                    break
+                current_position = next_position
+                distance_traveled += step_size
+            return distance_traveled
+
+
+
+
+        print(f'sub_target_id:{sub_target_id}')
+        target_name,target_position, target_dims = get_object_position(sub_target_id)
+        print(f'target:{target_tuple[4].lower()}')
+        print(f'final_goal:{final_goal.lower()}')
+        print(f'final_length:{final_length}')
+
+        if target_position[0] == last_target_position[0] and target_position[2] == last_target_position[2]:
+            if objects[0] in trajectory:
+                continue
+            else:
+                trajectory += f'{objects[0]}. '
+                continue
+        last_target_position = copy.deepcopy(target_position)
+        if target_position is not None:
+            path = ThorShortestPath()
+            path.requested_start = agent.state.position
+            path.requested_end = target_position
+
+            current_position = copy.deepcopy(agent.state.position)
+            previous_position = copy.deepcopy(current_position)
+            steps = 0
+            total_distance_traveled = 0.0
+            step_size = 0.25
+            current_index = 0
+
+            pathfinder_start_time = time.perf_counter()
+            found_path = sim.pathfinder.find_path(path)
+            pathfinder_elapsed = time.perf_counter() - pathfinder_start_time
+            print(
+                f"[Timing] pathfinder to-subgoal elapsed={pathfinder_elapsed:.3f}s "
+                f"found={found_path}"
+            )
+            path_points = path.points
+            if found_path:
+                observations = []
+                subgoal_visible_logged = False
+                final_goal_visible_logged = False
+                while current_index < len(path_points) - 1:
+                    segment_start = current_position
+                    segment_end = np.array(path_points[current_index + 1])  # 确保 segment_end 可写
+
+                    direction = segment_end - segment_start
+                    segment_distance = np.linalg.norm(direction)
+                    if segment_distance <= step_size:
+                        current_position = segment_end
+                        current_index += 1
+                    else:
+                        direction /= segment_distance
+                        current_position += direction * step_size
+
+                    distance_to_target = np.linalg.norm(current_position - target_position)
+                    if early_stop ==True:
+                        stop_distance = 0.25
+                    else:
+                        stop_distance = 0.05
+                    if distance_to_target <= stop_distance :
+                        print("Agent is within 1m of the target. Stopping.")
+                        break
+
+                    agent_state = ThorAgentState(np.array(current_position, dtype=np.float32), float(agent_state.rotation))
+
+                    if current_index < len(path_points) - 1:
+                        next_point = np.array(path_points[current_index + 1])  # 确保 next_point 可写
+                        direction_to_next = next_point - current_position
+                        direction_to_next /= np.linalg.norm(direction_to_next)
+                        agent_state.rotation = vector_to_yaw(direction_to_next)
+
+                    agent.set_state(agent_state)
+
+                    step_distance = np.linalg.norm(current_position - previous_position)
+                    total_distance_traveled += step_distance
+                    previous_position = current_position.copy()
+
+                    observations = sim.get_sensor_observations()
+                    semantic_frame = observations["semantic_sensor"]
+                    if not subgoal_visible_logged:
+                        subgoal_visible, subgoal_visible_ratio, subgoal_bbox_width, subgoal_bbox_height = is_object_clearly_visible(
+                            semantic_frame,
+                            sub_target_id,
+                            visible_ratio_threshold,
+                            min_visible_bbox_side_px,
+                        )
+                        if subgoal_visible:
+                            print(
+                                f"[Debug] sub-goal visible on screen: label={target_tuple[4].lower()} "
+                                f"ratio={subgoal_visible_ratio:.6f} bbox={subgoal_bbox_width}x{subgoal_bbox_height}"
+                            )
+                            subgoal_visible_logged = True
+                    if final_goal_label_ids and not final_goal_visible_logged:
+                        best_goal_ratio = 0.0
+                        best_goal_id = None
+                        best_goal_bbox_width = 0
+                        best_goal_bbox_height = 0
+                        for goal_label_id in final_goal_label_ids:
+                            goal_visible, goal_ratio, goal_bbox_width, goal_bbox_height = is_object_clearly_visible(
+                                semantic_frame,
+                                goal_label_id,
+                                goal_success_visible_ratio_threshold,
+                                goal_success_min_bbox_side_px,
+                            )
+                            if not goal_visible:
+                                continue
+                            if goal_ratio > best_goal_ratio:
+                                best_goal_ratio = goal_ratio
+                                best_goal_id = goal_label_id
+                                best_goal_bbox_width = goal_bbox_width
+                                best_goal_bbox_height = goal_bbox_height
+                        if best_goal_id is not None:
+                            goal_name, _, _ = get_object_position(best_goal_id)
+                            color_image = observations["color_sensor"]
+                            detection_request_id = f"goal-visible-{topomap.num_node}-{epoch}-{steps + 1}"
+                            rgb_goal_detection = detect_goal_in_current_view(
+                                color_image,
+                                canonical_goal_name(goal_name),
+                                detection_request_id,
+                                int(agent_state.rotation),
+                            )
+                            if rgb_goal_detection is not None:
+                                print(
+                                    f"[Debug] final goal visible on screen: label={canonical_goal_name(goal_name)} "
+                                    f"ratio={best_goal_ratio:.6f} semantic_bbox={best_goal_bbox_width}x{best_goal_bbox_height} "
+                                    f"rgb_bbox={rgb_goal_detection['width']}x{rgb_goal_detection['height']}"
+                                )
+                                final_goal_visible_logged = True
+                                episode_success = True
+                                visible_goal_name, visible_goal_target_position, _ = get_object_position(best_goal_id)
+                                direction_to_visible_goal = (
+                                    np.array(visible_goal_target_position, dtype=np.float32)
+                                    - np.array(agent.state.position, dtype=np.float32)
+                                )
+                                direction_to_visible_goal[1] = 0.0
+                                if np.linalg.norm(direction_to_visible_goal) > 1e-6:
+                                    agent_state = ThorAgentState(
+                                        np.array(agent.state.position, dtype=np.float32),
+                                        vector_to_yaw(direction_to_visible_goal),
+                                    )
+                                    agent.set_state(agent_state)
+                                    observations = sim.get_sensor_observations()
+                                    color_image = observations["color_sensor"]
+                                    semantic_frame = observations["semantic_sensor"]
+                                    print(
+                                        f"[Debug] oriented camera toward final goal: "
+                                        f"label={canonical_goal_name(goal_name)} yaw={agent_state.rotation:.1f}"
+                                    )
+                                bbox_debug_path = f"tmp/navigation_images/final_goal_visible_step_{steps + 1}.png"
+                                if save_goal_bbox_debug(
+                                    color_image,
+                                    semantic_frame,
+                                    best_goal_id,
+                                    canonical_goal_name(goal_name),
+                                    bbox_debug_path,
+                                ):
+                                    print(f"[Debug] saved final goal bbox: {bbox_debug_path}")
+                                image_path = f"tmp/navigation_images/navigation_step_{steps + 1}.png"
+                                imageio.imwrite(image_path, color_image)
+                                steps += 1
+                                break
+                            print(
+                                f"[Debug] semantic goal candidate rejected by RGB detector: "
+                                f"label={canonical_goal_name(goal_name)} ratio={best_goal_ratio:.6f} "
+                                f"semantic_bbox={best_goal_bbox_width}x{best_goal_bbox_height}"
+                            )
+                    color_image = observations["color_sensor"]
+                    image_path = f"tmp/navigation_images/navigation_step_{steps + 1}.png"
+                    imageio.imwrite(image_path, color_image)
+                    steps += 1
+
+                if episode_success:
+                    final_length += total_distance_traveled
+                    length_this_epoch += total_distance_traveled
+                    trajectory_length += total_distance_traveled
+                    if approach_visible_goal_with_gt and visible_goal_target_position is not None:
+                        print("[Debug] final goal detected; approaching GT coordinates before stopping")
+                        approach_stop_distance = 1.5
+                        approach_path = ThorShortestPath()
+                        approach_path.requested_start = agent.state.position
+                        approach_path.requested_end = visible_goal_target_position
+                        approach_pathfinder_start_time = time.perf_counter()
+                        approach_found_path = sim.pathfinder.find_path(approach_path)
+                        approach_pathfinder_elapsed = time.perf_counter() - approach_pathfinder_start_time
+                        print(
+                            f"[Timing] pathfinder final-approach elapsed={approach_pathfinder_elapsed:.3f}s "
+                            f"found={approach_found_path}"
+                        )
+                        if approach_found_path:
+                            approach_points = approach_path.points
+                            approach_current_position = copy.deepcopy(agent.state.position)
+                            approach_previous_position = copy.deepcopy(approach_current_position)
+                            approach_index = 0
+                            approach_distance_traveled = 0.0
+                            while approach_index < len(approach_points) - 1:
+                                approach_segment_end = np.array(approach_points[approach_index + 1])
+                                approach_direction = approach_segment_end - approach_current_position
+                                approach_segment_distance = np.linalg.norm(approach_direction)
+                                if approach_segment_distance <= step_size:
+                                    approach_current_position = approach_segment_end
+                                    approach_index += 1
+                                else:
+                                    approach_direction /= approach_segment_distance
+                                    approach_current_position += approach_direction * step_size
+
+                                distance_to_visible_goal = np.linalg.norm(approach_current_position - visible_goal_target_position)
+                                if distance_to_visible_goal <= approach_stop_distance:
+                                    print(f"[Debug] close enough to final goal coordinates: label={canonical_goal_name(visible_goal_name)} distance={distance_to_visible_goal:.3f}")
+                                    break
+
+                                agent_state = ThorAgentState(np.array(approach_current_position, dtype=np.float32), float(agent_state.rotation))
+                                if approach_index < len(approach_points) - 1:
+                                    approach_next_point = np.array(approach_points[approach_index + 1])
+                                    approach_direction_to_next = approach_next_point - approach_current_position
+                                    if np.linalg.norm(approach_direction_to_next) > 1e-6:
+                                        approach_direction_to_next /= np.linalg.norm(approach_direction_to_next)
+                                        agent_state.rotation = vector_to_yaw(approach_direction_to_next)
+                                agent.set_state(agent_state)
+                                approach_step_distance = np.linalg.norm(approach_current_position - approach_previous_position)
+                                approach_distance_traveled += approach_step_distance
+                                approach_previous_position = approach_current_position.copy()
+                            final_length += approach_distance_traveled
+                            length_this_epoch += approach_distance_traveled
+                            trajectory_length += approach_distance_traveled
+                        else:
+                            print("[Debug] no path found for final goal close approach")
+                    else:
+                        print("[Debug] final goal detected by observation; stopping at current position without GT coordinate approach")
+                    sr = 1
+                    spl = 1 if final_length == 0 else min(1, distance / max(final_length, 1e-6))
+                    break
+
+                if is_door(sub_target_id) and through_door:
+                    print("Target object is a door. Detecting distance ahead...")
+                    direction_to_target = yaw_to_vector(agent.state.rotation)
+                    max_distance_ahead = detect_distance_ahead(agent.state.position, direction_to_target)
+                    print(f"Maximum distance ahead in the current direction: {max_distance_ahead:.2f} meters")
+                    move_steps = int(max_distance_ahead / 0.25)
+                    if move_steps > 0:
+                        for _ in range(move_steps+3):
+                            agent.act("move_forward")
+                            total_distance_traveled += 0.25
+                final_length += total_distance_traveled
+                length_this_epoch += total_distance_traveled
+                trajectory_length += total_distance_traveled
+            else:
+                print('No path found')
+        if not(last_answer == llava_answer2 and use_pruning):
+            last_answer = llava_answer2
+
+
+        if episode_success:
+            break
+
+    episode_elapsed = time.perf_counter() - episode_start_time
+    print(
+        f"[Timing] episode elapsed={episode_elapsed:.3f}s sr={sr} "
+        f"spl={spl:.4f} final_length={final_length:.4f} "
+        f"trajectory_length={trajectory_length:.4f}"
+    )
+    return sr,spl,real_distance,final_length
+
+
+
+
+def val_auto():
+    experiment_seed = int(os.environ.get("EFFICIENTNAV_EXPERIMENT_SEED", "7"))
+    fixed_goal_instance_index_raw = os.environ.get("EFFICIENTNAV_FIXED_GOAL_INSTANCE_INDEX")
+    fixed_start_index_raw = os.environ.get("EFFICIENTNAV_FIXED_START_INDEX")
+    fixed_start_rotation_raw = os.environ.get("EFFICIENTNAV_FIXED_START_ROTATION")
+
+    fixed_goal_instance_index = None if fixed_goal_instance_index_raw in (None, "") else int(fixed_goal_instance_index_raw)
+    fixed_start_index = None if fixed_start_index_raw in (None, "") else int(fixed_start_index_raw)
+    fixed_start_rotation = None if fixed_start_rotation_raw in (None, "") else float(fixed_start_rotation_raw)
+
+    houses = load_procthor_houses(seed=experiment_seed, split=os.environ.get("EFFICIENTNAV_PROCTHOR_SPLIT", "train"))
+    forced_house_index_raw = os.environ.get("EFFICIENTNAV_HOUSE_INDEX", "")
+    forced_house_index = None
+    if forced_house_index_raw not in (None, ""):
+        try:
+            forced_house_index = int(forced_house_index_raw)
+        except ValueError:
+            print(f"[Debug] invalid EFFICIENTNAV_HOUSE_INDEX={forced_house_index_raw!r}; falling back to sequential houses")
+            forced_house_index = None
+    if forced_house_index is not None:
+        if forced_house_index < 0 or forced_house_index >= len(houses):
+            print(
+                f"[Debug] EFFICIENTNAV_HOUSE_INDEX={forced_house_index} is out of range "
+                f"(available: 0..{len(houses) - 1}); falling back to house 0"
+            )
+            forced_house_index = 0
+        houses = [houses[forced_house_index]]
+        print(f"[Debug] using forced house index={forced_house_index}")
+
+    completed_eval_episodes = 0
+    sim = None
+    topomap = None
+    for i, house in enumerate(houses):
+        SR = 0.0
+        SPL = 0.0
+        total_episode = 0
+        total_length = 0.0
+        total_length_sr = 0.0
+        easy_SR = 0.0
+        easy_SPL = 0.0
+        easy_episode = 0
+        easy_threshould = 6.0
+        easy_length = 0.0
+        medium_SR = 0.0
+        medium_SPL = 0.0
+        medium_episode = 0
+        medium_length = 0.0
+        hard_threshould = 9.0
+        hard_SR = 0.0
+        hard_SPL = 0.0
+        hard_episode = 0
+        hard_length = 0.0
+        if completed_eval_episodes >= num_episode:
+            break
+
+        sim_settings = {
+            "width": 1024,
+            "height": 1024,
+            "sensor_height": 1,
+            "color_sensor": True,
+            "depth_sensor": True,
+            "semantic_sensor": True,
+            "seed": experiment_seed,
+            "enable_physics": False,
+            "fov_horizontal": 90.0,
+            "grid_size": 0.25,
+            "house": house,
+        }
+
+        cfg = make_cfg(sim_settings)
+
+        if sim is not None:
+            try:
+                sim.close()
+            except Exception:
+                pass
+
+        sim = ThorSim(cfg)
+
+        random.seed(sim_settings["seed"])
+        sim.seed(sim_settings["seed"])
+
+        sim.initialize_agent(agent_id=0)
+        agent = sim.agents[0]
+
+        if topomap is not None:
+            del topomap
+            topomap = None
+            gc.collect()
+            print('scene change')
+
+        selected_goal_name = choose_goal_name_for_house(sim.semantic_scene)
+        if selected_goal_name is None:
+            print("[Debug] skipping house because no target object could be selected")
+            continue
+
+        SR_eposion = []
+        fail_eposion = []
+        subgoal_found = []
+
+        reachable_positions = sim._reachable_positions
+        candidate_objects = [
+            (idx, obj) for idx, obj in enumerate(sim.semantic_scene.objects)
+            if idx != 0 and canonical_goal_name(obj.category.name()) == selected_goal_name
+        ]
+        print(
+            f"[Debug] reachable_positions={len(reachable_positions)} "
+            f"candidate_objects_for_{selected_goal_name}={len(candidate_objects)}"
+        )
+        if len(reachable_positions) == 0 or len(candidate_objects) == 0:
+            print(
+                f"[Debug] skipping house because reachable_positions={len(reachable_positions)} "
+                f"or candidate_objects={len(candidate_objects)} is empty"
+            )
+            continue
+
+        for j in range(num_environment):
+            if completed_eval_episodes >= num_episode:
+                break
+            if j >= num_environment:
+                break
+            topomap = Navigation_map()
+            topomap.planner_model = planner_model
+            topomap.semantic_model = model_clip
+            topomap.processor = planner_text_processor
+            topomap.use_kv_cache = use_kv_cache
+            topomap.similarity_threshould = [0.0 for _ in range(len(final_goal_list))]
+            topomap.similarity_times = [0 for _ in range(len(final_goal_list))]
+            print(f"[Debug] starting independent environment episode={j + 1}/{num_environment}")
+
+            if fixed_goal_instance_index is not None:
+                if fixed_goal_instance_index < 0 or fixed_goal_instance_index >= len(candidate_objects):
+                    print(
+                        f"[Debug] EFFICIENTNAV_FIXED_GOAL_INSTANCE_INDEX={fixed_goal_instance_index} "
+                        f"is out of range for {selected_goal_name} candidates (0..{len(candidate_objects)-1}); "
+                        f"falling back to candidate 0"
+                    )
+                    selected_goal_instance_index = 0
+                else:
+                    selected_goal_instance_index = fixed_goal_instance_index
+                final_goal_id, goal_object = candidate_objects[selected_goal_instance_index]
+            else:
+                final_goal_id, goal_object = random.choice(candidate_objects)
+            final_goal = selected_goal_name
+            if fixed_start_index is not None:
+                if fixed_start_index < 0 or fixed_start_index >= len(reachable_positions):
+                    print(
+                        f"[Debug] EFFICIENTNAV_FIXED_START_INDEX={fixed_start_index} "
+                        f"is out of range for reachable positions (0..{len(reachable_positions)-1}); "
+                        f"falling back to reachable position 0"
+                    )
+                    selected_start_index = 0
+                else:
+                    selected_start_index = fixed_start_index
+                start_point = copy.deepcopy(reachable_positions[selected_start_index])
+            else:
+                start_point = copy.deepcopy(random.choice(reachable_positions))
+                selected_start_index = None
+
+            if fixed_start_rotation is not None:
+                start_rotation = float(fixed_start_rotation)
+            else:
+                start_rotation = random.choice([0.0, 90.0, 180.0, 270.0])
+
+            print(
+                f"[Debug] experiment setup: seed={experiment_seed} "
+                f"goal_instance_index={selected_goal_instance_index if fixed_goal_instance_index is not None else 'random'} "
+                f"start_index={selected_start_index if selected_start_index is not None else 'random'} "
+                f"start_rotation={start_rotation} "
+                f"start_point=({start_point[0]:.3f}, {start_point[1]:.3f}, {start_point[2]:.3f})"
+            )
+            path = ThorShortestPath()
+            path.requested_start = start_point
+            path.requested_end = goal_object.obb.center
+            found_path = sim.pathfinder.find_path(path)
+            if not found_path:
+                print(
+                    f"[Debug] skipping episode because no path from start_index="
+                    f"{selected_start_index if selected_start_index is not None else 'random'} "
+                    f"to goal_instance_index="
+                    f"{selected_goal_instance_index if fixed_goal_instance_index is not None else 'random'}"
+                )
+                continue
+            geodesic_distance = 0.0
+            for k in range(1, len(path.points)):
+                geodesic_distance += math.sqrt(
+                    (path.points[k][0] - path.points[k - 1][0]) ** 2
+                    + (path.points[k][2] - path.points[k - 1][2]) ** 2
+                )
+            if geodesic_distance <= 0.0:
+                print("[Debug] skipping episode because geodesic distance is non-positive")
+                continue
+            distance = geodesic_distance
+            episode_wall_start_time = time.perf_counter()
+            sr, spl, real_distance,final_length= val_one_episode(topomap,sim,agent,start_point,start_rotation,final_goal_id,final_goal,distance)
+            episode_wall_elapsed = time.perf_counter() - episode_wall_start_time
+            SR += sr
+            SPL += spl
+            total_episode +=1
+            completed_eval_episodes += 1
+            total_length += final_length
+            print(
+                f"[Timing] val_auto episode total elapsed={episode_wall_elapsed:.3f}s "
+                f"goal={final_goal} sr={sr} spl={spl:.4f} "
+                f"completed_eval_episodes={completed_eval_episodes}/{num_episode}"
+            )
+            if sr == 1:
+                print(f"[Debug] episode success: final_goal={final_goal} sr={sr} spl={spl:.4f} final_length={final_length:.4f}")
+                total_length_sr += final_length
+                SR_eposion.append(j)
+                subgoal_found.append(final_goal)
+                if os.environ.get("EFFICIENTNAV_HOLD_ON_SUCCESS", "0") == "1":
+                    print("[Debug] goal reached and visible. Holding current view. Press Ctrl-C to exit.")
+                    while True:
+                        time.sleep(1.0)
+            else:
+                fail_eposion.append(final_goal)
+            if distance < easy_threshould:
+                easy_SR += sr
+                easy_SPL += spl
+                easy_episode +=1
+                if sr == 1:
+                    easy_length += final_length
+            elif distance > hard_threshould:
+                hard_SR += sr
+                hard_SPL += spl
+                hard_episode +=1
+                if sr == 1:
+                    hard_length += final_length
+            else:
+                medium_SR += sr
+                medium_SPL += spl
+                medium_episode += 1
+                if sr == 1:
+                    medium_length += final_length
+            os.makedirs(f'output/{current_time}', exist_ok=True)
+            file_name_result = f'output/{current_time}/results{completed_eval_episodes - 1}_test.txt'
+            with open(file_name_result, 'w') as file:
+                file.write(f"SR: {SR}\n")
+                file.write(f"SPL: {SPL}\n")
+                file.write(f"Total Episodes: {total_episode}\n")
+                file.write(f"Total Length: {total_length}\n")
+                file.write(f"Easy SR: {easy_SR}\n")
+                file.write(f"Easy SPL: {easy_SPL}\n")
+                file.write(f"Easy Episodes: {easy_episode}\n")
+                file.write(f"Easy Length: {easy_length}\n")
+                file.write(f"Medium SR: {medium_SR}\n")
+                file.write(f"Medium SPL: {medium_SPL}\n")
+                file.write(f"Medium Episodes: {medium_episode}\n")
+                file.write(f"Medium Length: {medium_length}\n")
+                file.write(f"Hard SR: {hard_SR}\n")
+                file.write(f"Hard SPL: {hard_SPL}\n")
+                file.write(f"Hard Episodes: {hard_episode}\n")
+                file.write(f"Hard Length: {hard_length}\n")
+                file.write(f"SR eposion: {SR_eposion}\n")
+                file.write(f"SR subgoal: {subgoal_found}\n")
+                file.write(f"num_node: {topomap.num_node}\n")
+
+
+
+
+
+val_auto()
