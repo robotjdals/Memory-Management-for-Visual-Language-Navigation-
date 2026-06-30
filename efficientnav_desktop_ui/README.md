@@ -15,12 +15,11 @@ pip install -r requirements.txt
 Linux/macOS:
 
 ```bash
-./run_desktop_ui.sh
-```
+source ~/miniconda3/bin/activate
+conda activate test
 
-또는:
-
-```bash
+source /opt/ros/humble/setup.bash
+source ~/DINO_ws/install/setup.bash
 python app.py
 ```
 
@@ -33,7 +32,7 @@ run_desktop_ui.bat
 ## 사용 순서
 
 1. `Paths` 탭에서 EfficientNav 프로젝트 루트와 entry script를 지정합니다.
-   - 예: project root = `/home/min/test`
+   - 예: project root = repository root
    - entry script = `efficientnav.py`
 2. `Experiment` 탭에서 목표 객체, episode, H2O, threshold를 설정합니다.
 3. `Run`을 누르면 설정값이 환경변수로 주입되고 기존 스크립트가 실행됩니다.
